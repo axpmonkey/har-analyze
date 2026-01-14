@@ -1,0 +1,107 @@
+[project]
+name = "har-analyzer"
+version = "0.1.0"
+description = "HAR file analyzer with deterministic performance insights"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Steve", email = "steve@example.com"}
+]
+
+dependencies = [
+    "pydantic>=2.5.0",
+    "typer>=0.9.0",
+    "rich>=13.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-env>=1.1.0",
+    "respx>=0.20.0",
+    "time-machine>=2.13.0",
+    "ruff>=0.1.0",
+    "basedpyright>=1.8.0",
+    "pip-audit>=2.6.0",
+]
+
+[project.scripts]
+har-analyzer = "har_analyzer.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Ruff configuration
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "PERF", "PTH", "PL", "PIE", "RUF", "Q", "D"]
+ignore = [
+    "D100",  # Missing module docstring
+    "D104",  # Missing package docstring
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "D103",  # No docstrings in tests
+    "PLR2004",  # Magic values OK in tests
+]
+
+# Basedpyright configuration
+[tool.basedpyright]
+typeCheckingMode = "strict"
+reportUnknownParameterType = "error"
+reportUnknownMemberType = "error"
+reportUnknownVariableType = "error"
+reportMissingTypeArgument = "error"
+reportUnnecessaryTypeIgnoreComment = "error"
+pythonVersion = "3.11"
+pythonPlatform = "All"
+include = ["src"]
+exclude = ["**/__pycache__", "**/.venv"]
+
+# Pytest configuration
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--cov=src/har_analyzer",
+    "--cov-branch",
+    "--cov-fail-under=90",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+]
+asyncio_mode = "auto"
+env = [
+    "TZ=UTC",
+    "PYTHONUTF8=1",
+    "LC_ALL=C.UTF-8",
+    "PYTHONWARNINGS=error",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["src/har_analyzer"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]

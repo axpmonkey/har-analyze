@@ -555,10 +555,7 @@ class OutputFormatter:
 
         console.print(table)
         if len(failing) > max_rows:
-            console.print(
-                f"[dim]... and {len(failing) - max_rows} more failing services "
-                "(see JSON export for full list)[/dim]"
-            )
+            console.print(f"[dim]... and {len(failing) - max_rows} more failing services[/dim]")
 
     def _print_issues_by_domain(self, issues: list[DetectedIssue], title: str) -> None:
         issues_by_domain: dict[str, list[DetectedIssue]] = defaultdict(list)

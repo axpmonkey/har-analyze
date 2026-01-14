@@ -61,8 +61,7 @@ uv run har-analyzer analyze <HAR_FILE> [OPTIONS]
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--output PATH` | `-o` | Export analysis to file (required for non-terminal formats) |
-| `--format FORMAT` | `-f` | Output format: `terminal`, `markdown`, `json`, or `csv` (default: `terminal`) |
+| `--output PATH` | `-o` | Export analysis to Markdown file |
 | `--timezone ZONE` | `-t` | Convert displayed timestamps to specified timezone (e.g., `UTC`, `local`, `America/New_York`) |
 | `--local-time` | | Convert displayed timestamps to your local timezone |
 | `--verbose` | `-v` | Enable verbose logging for debugging |
@@ -75,47 +74,14 @@ Display version information.
 uv run har-analyzer version
 ```
 
-## Output Formats
+## Output
 
-### Terminal (Default)
+By default, results are displayed in the terminal with rich, colorized tables and panels.
 
-Rich, colorized tables and panels displayed directly in the terminal. Ideal for interactive analysis.
-
-```bash
-uv run har-analyzer analyze capture.har
-```
-
-### Markdown
-
-Single Markdown report file suitable for documentation, sharing, or integration with wikis and issue trackers.
+Use `--output` to export the analysis as a Markdown file:
 
 ```bash
-uv run har-analyzer analyze capture.har --format markdown --output report.md
-```
-
-### JSON
-
-Structured JSON output containing the complete analysis report with all metrics and issues. Suitable for programmatic processing and integration with other tools.
-
-```bash
-uv run har-analyzer analyze capture.har --format json --output report.json
-```
-
-### CSV
-
-Multiple CSV files generated from a base filename, each containing a specific aspect of the analysis:
-
-| File | Contents |
-|------|----------|
-| `*_summary.csv` | Overall metrics and statistics |
-| `*_issues.csv` | All detected issues with details |
-| `*_endpoints.csv` | Per-endpoint timing statistics |
-| `*_domains.csv` | Per-domain health analysis |
-| `*_services.csv` | Backend service failure breakdown |
-
-```bash
-uv run har-analyzer analyze capture.har --format csv --output report.csv
-# Creates: report_summary.csv, report_issues.csv, report_endpoints.csv, etc.
+uv run har-analyzer analyze capture.har --output report.md
 ```
 
 ## Examples
@@ -126,22 +92,10 @@ uv run har-analyzer analyze capture.har --format csv --output report.csv
 uv run har-analyzer analyze network-capture.har
 ```
 
-### Export to Markdown for Documentation
+### Export to Markdown
 
 ```bash
-uv run har-analyzer analyze network-capture.har -f markdown -o analysis-report.md
-```
-
-### Export to JSON for Processing
-
-```bash
-uv run har-analyzer analyze network-capture.har -f json -o analysis.json
-```
-
-### Export to CSV for Spreadsheet Analysis
-
-```bash
-uv run har-analyzer analyze network-capture.har -f csv -o metrics.csv
+uv run har-analyzer analyze network-capture.har -o analysis-report.md
 ```
 
 ### Display Timestamps in Local Time

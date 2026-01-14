@@ -15,6 +15,27 @@ HAR Analyzer parses HAR 1.2 files captured from browser developer tools or netwo
 - **Cache Analysis**: Cache hit/miss ratios and detection of repeatedly downloaded resources
 - **Root Cause Hints**: Actionable troubleshooting suggestions for each detected issue
 
+### Detected Issue Types
+
+HAR Analyzer automatically detects and categorizes the following issues:
+
+| Issue Type | Severity | Description |
+|------------|----------|-------------|
+| Network Error | Critical | Connection failures (status=0 or explicit error) |
+| Duration Exceeded | Critical | Requests exceeding 30-second threshold |
+| Server Error | High | HTTP 5xx responses |
+| Client Error | Medium/High | HTTP 4xx responses (401/403 are High severity) |
+| Slow Endpoint | High | Endpoints with p95 latency > 10 seconds |
+| Large Payload | Medium | Responses exceeding 1 MB |
+| Blocking | Medium | Client-side connection blocking > 5 seconds |
+| Redirect Chain | Low | HTTP 302/303 redirects |
+
+Each detected issue includes:
+- Timestamp of when the request occurred
+- Full URL and HTTP method
+- Duration and response size (where applicable)
+- Root cause hints with actionable troubleshooting suggestions
+
 ## Installation
 
 ### Prerequisites
@@ -61,27 +82,19 @@ uv run har-analyzer analyze <HAR_FILE> [OPTIONS]
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--output PATH` | `-o` | Export analysis to Markdown file |
+| `--export PATH` | `-e` | Export analysis to Markdown file |
 | `--timezone ZONE` | `-t` | Convert displayed timestamps to specified timezone (e.g., `UTC`, `local`, `America/New_York`) |
 | `--local-time` | | Convert displayed timestamps to your local timezone |
 | `--verbose` | `-v` | Enable verbose logging for debugging |
-
-### `version` Command
-
-Display version information.
-
-```bash
-uv run har-analyzer version
-```
 
 ## Output
 
 By default, results are displayed in the terminal with rich, colorized tables and panels.
 
-Use `--output` to export the analysis as a Markdown file:
+Use `--export` to export the analysis as a Markdown file:
 
 ```bash
-uv run har-analyzer analyze capture.har --output report.md
+uv run har-analyzer analyze capture.har --export report.md
 ```
 
 ## Examples
@@ -95,7 +108,7 @@ uv run har-analyzer analyze network-capture.har
 ### Export to Markdown
 
 ```bash
-uv run har-analyzer analyze network-capture.har -o analysis-report.md
+uv run har-analyzer analyze network-capture.har -e analysis-report.md
 ```
 
 ### Display Timestamps in Local Time
@@ -115,27 +128,6 @@ uv run har-analyzer analyze network-capture.har --timezone America/Los_Angeles
 ```bash
 uv run har-analyzer analyze network-capture.har --verbose
 ```
-
-## Detected Issue Types
-
-HAR Analyzer automatically detects and categorizes the following issues:
-
-| Issue Type | Severity | Description |
-|------------|----------|-------------|
-| Network Error | Critical | Connection failures (status=0 or explicit error) |
-| Duration Exceeded | Critical | Requests exceeding 30-second threshold |
-| Server Error | High | HTTP 5xx responses |
-| Client Error | Medium/High | HTTP 4xx responses (401/403 are High severity) |
-| Slow Endpoint | High | Endpoints with p95 latency > 10 seconds |
-| Large Payload | Medium | Responses exceeding 1 MB |
-| Blocking | Medium | Client-side connection blocking > 5 seconds |
-| Redirect Chain | Low | HTTP 302/303 redirects |
-
-Each detected issue includes:
-- Timestamp of when the request occurred
-- Full URL and HTTP method
-- Duration and response size (where applicable)
-- Root cause hints with actionable troubleshooting suggestions
 
 ## Timestamp Display
 

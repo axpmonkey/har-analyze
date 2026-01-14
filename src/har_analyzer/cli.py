@@ -35,8 +35,8 @@ def analyze(
     har_file: Path = typer.Argument(  # noqa: B008
         ..., exists=True, file_okay=True, dir_okay=False, readable=True, help="Path to HAR file"
     ),
-    output: Path | None = typer.Option(  # noqa: B008
-        None, "--output", "-o", help="Export analysis to Markdown file"
+    export: Path | None = typer.Option(  # noqa: B008
+        None, "--export", "-e", help="Export analysis to Markdown file"
     ),
     timezone: str | None = typer.Option(
         None,
@@ -58,7 +58,7 @@ def analyze(
       har-analyzer analyze myfile.har
 
       # Export to markdown
-      har-analyzer analyze myfile.har -o report.md
+      har-analyzer analyze myfile.har -e report.md
 
       # With verbose logging
       har-analyzer analyze myfile.har -v
@@ -71,7 +71,7 @@ def analyze(
     try:
         _run_analysis(
             har_file,
-            output,
+            export,
             timestamp_timezone=timestamp_timezone,
             timestamp_timezone_label=timestamp_timezone_label,
         )
@@ -85,7 +85,7 @@ def analyze(
 
 def _run_analysis(
     har_file: Path,
-    output_file: Path | None = None,
+    export_file: Path | None = None,
     *,
     timestamp_timezone: tzinfo | None,
     timestamp_timezone_label: str | None,
@@ -101,10 +101,10 @@ def _run_analysis(
     report = coordinator.analyze_har_file(har_file)
 
     # Export to markdown file or display to terminal
-    if output_file:
+    if export_file:
         markdown_content = formatter.generate_markdown_report(report, har_file.name)
-        output_file.write_text(markdown_content, encoding="utf-8")
-        typer.echo(f"Markdown report exported to: {output_file}")
+        export_file.write_text(markdown_content, encoding="utf-8")
+        typer.echo(f"Markdown report exported to: {export_file}")
     else:
         formatter.print_report(report)
 

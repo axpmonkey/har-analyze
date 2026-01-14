@@ -38,13 +38,13 @@ uv sync
 ### Basic Command
 
 ```bash
-har-analyzer analyze <har-file>
+uv run har-analyzer analyze <har-file>
 ```
 
 ### Running with Python Module
 
 ```bash
-python -m har_analyzer analyze <har-file>
+uv run python -m har_analyzer analyze <har-file>
 ```
 
 ## CLI Reference
@@ -54,7 +54,7 @@ python -m har_analyzer analyze <har-file>
 Analyze a HAR file and generate performance insights.
 
 ```
-har-analyzer analyze <HAR_FILE> [OPTIONS]
+uv run har-analyzer analyze <HAR_FILE> [OPTIONS]
 ```
 
 **Arguments:**
@@ -78,7 +78,7 @@ har-analyzer analyze <HAR_FILE> [OPTIONS]
 Display version information.
 
 ```bash
-har-analyzer version
+uv run har-analyzer version
 ```
 
 ## Output Formats
@@ -88,7 +88,7 @@ har-analyzer version
 Rich, colorized tables and panels displayed directly in the terminal. Ideal for interactive analysis.
 
 ```bash
-har-analyzer analyze capture.har
+uv run har-analyzer analyze capture.har
 ```
 
 ### Markdown
@@ -96,7 +96,7 @@ har-analyzer analyze capture.har
 Single Markdown report file suitable for documentation, sharing, or integration with wikis and issue trackers.
 
 ```bash
-har-analyzer analyze capture.har --format markdown --output report.md
+uv run har-analyzer analyze capture.har --format markdown --output report.md
 ```
 
 ### JSON
@@ -104,7 +104,7 @@ har-analyzer analyze capture.har --format markdown --output report.md
 Structured JSON output containing the complete analysis report with all metrics and issues. Suitable for programmatic processing and integration with other tools.
 
 ```bash
-har-analyzer analyze capture.har --format json --output report.json
+uv run har-analyzer analyze capture.har --format json --output report.json
 ```
 
 ### CSV
@@ -120,7 +120,7 @@ Multiple CSV files generated from a base filename, each containing a specific as
 | `*_services.csv` | Backend service failure breakdown |
 
 ```bash
-har-analyzer analyze capture.har --format csv --output report.csv
+uv run har-analyzer analyze capture.har --format csv --output report.csv
 # Creates: report_summary.csv, report_issues.csv, report_endpoints.csv, etc.
 ```
 
@@ -129,43 +129,43 @@ har-analyzer analyze capture.har --format csv --output report.csv
 ### Analyze a HAR File with Terminal Output
 
 ```bash
-har-analyzer analyze network-capture.har
+uv run har-analyzer analyze network-capture.har
 ```
 
 ### Export to Markdown for Documentation
 
 ```bash
-har-analyzer analyze network-capture.har -f markdown -o analysis-report.md
+uv run har-analyzer analyze network-capture.har -f markdown -o analysis-report.md
 ```
 
 ### Export to JSON for Processing
 
 ```bash
-har-analyzer analyze network-capture.har -f json -o analysis.json
+uv run har-analyzer analyze network-capture.har -f json -o analysis.json
 ```
 
 ### Export to CSV for Spreadsheet Analysis
 
 ```bash
-har-analyzer analyze network-capture.har -f csv -o metrics.csv
+uv run har-analyzer analyze network-capture.har -f csv -o metrics.csv
 ```
 
 ### Display Timestamps in Local Time
 
 ```bash
-har-analyzer analyze network-capture.har --local-time
+uv run har-analyzer analyze network-capture.har --local-time
 ```
 
 ### Display Timestamps in a Specific Timezone
 
 ```bash
-har-analyzer analyze network-capture.har --timezone America/Los_Angeles
+uv run har-analyzer analyze network-capture.har --timezone America/Los_Angeles
 ```
 
 ### Enable Verbose Logging
 
 ```bash
-har-analyzer analyze network-capture.har --verbose
+uv run har-analyzer analyze network-capture.har --verbose
 ```
 
 ## Detected Issue Types
@@ -188,24 +188,6 @@ Each detected issue includes:
 - Full URL and HTTP method
 - Duration and response size (where applicable)
 - Root cause hints with actionable troubleshooting suggestions
-
-## Capturing HAR Files
-
-### From Browser Developer Tools
-
-1. Open browser Developer Tools (F12 or Cmd+Option+I)
-2. Navigate to the **Network** tab
-3. Ensure recording is enabled (red dot)
-4. Perform the actions you want to capture
-5. Right-click in the network list and select **Save all as HAR with content**
-
-### From Network Proxies
-
-HAR files can also be exported from tools such as:
-- Charles Proxy
-- Fiddler
-- mitmproxy
-- Postman
 
 ## Timestamp Display
 

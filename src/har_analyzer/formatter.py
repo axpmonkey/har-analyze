@@ -110,14 +110,7 @@ class OutputFormatter:
         lines = [f"# HAR Analysis Report: {har_filename}", ""]
         if self._timestamp_timezone_label:
             lines.extend([f"**Timestamp Timezone:** {self._timestamp_timezone_label}", ""])
-        lines.extend(
-            [
-                "*Note: This report contains only deterministic findings derived from the HAR.*",
-                "",
-                "---",
-                "",
-            ]
-        )
+        lines.extend(["---", ""])
         return lines
 
     def _md_hostnames(self, report: HarAnalysisReport) -> list[str]:
@@ -309,7 +302,7 @@ class OutputFormatter:
         if issue.duration_ms is not None:
             lines.append(f"  - Duration: {issue.duration_ms:.0f}ms")
         for key, value in issue.details.items():
-            if key == "method":
+            if key in ("method", "referer_hostname"):
                 continue
             lines.append(f"  - {key}: {value}")
         lines.append("")

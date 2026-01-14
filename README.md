@@ -41,12 +41,6 @@ uv sync
 uv run har-analyzer analyze <har-file>
 ```
 
-### Running with Python Module
-
-```bash
-uv run python -m har_analyzer analyze <har-file>
-```
-
 ## CLI Reference
 
 ### `analyze` Command

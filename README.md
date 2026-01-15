@@ -43,7 +43,18 @@ Each detected issue includes:
 ### Prerequisites
 
 - Python 3.11 or later
-- [uv](https://docs.astral.sh/uv/) package manager
+
+### Install uv
+
+```bash
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://astral.sh/uv/install.ps1 | iex
+```
 
 ### Setup
 
@@ -56,18 +67,12 @@ cd har-analyze
 uv sync
 ```
 
-## Usage
+## Run the analyzer
 
 ### Basic Command
 
 ```bash
 uv run har-analyze analyze <har-file>
-```
-
-### Show Version
-
-```bash
-uv run har-analyze version
 ```
 
 ## CLI Reference

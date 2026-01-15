@@ -101,8 +101,6 @@ class HarPostData(BaseModel):
     """POST request data."""
 
     mime_type: str = Field(alias="mimeType")
-    params: list[dict[str, str]] = Field(default_factory=list)
-    text: str | None = None
 
 
 class HarRequest(BaseModel):
@@ -112,34 +110,16 @@ class HarRequest(BaseModel):
     url: str
     http_version: str = Field(alias="httpVersion")
     headers: list[HarHeader]
-    query_string: list[HarQueryParam] = Field(alias="queryString")
-    cookies: list[HarCookie]
-    headers_size: int = Field(alias="headersSize")
     body_size: int = Field(alias="bodySize")
     post_data: HarPostData | None = Field(None, alias="postData")
-
-
-class HarContent(BaseModel):
-    """Response content."""
-
-    size: int
-    compression: int | None = None
-    mime_type: str = Field(alias="mimeType")
-    text: str | None = None
-    encoding: str | None = None
-
 
 class HarResponse(BaseModel):
     """HTTP response."""
 
     status: int
     status_text: str = Field(alias="statusText")
-    http_version: str = Field(alias="httpVersion")
     headers: list[HarHeader]
-    cookies: list[HarCookie]
-    content: HarContent
     redirect_url: str = Field("", alias="redirectURL")
-    headers_size: int = Field(alias="headersSize")
     body_size: int = Field(alias="bodySize")
     transfer_size: int | None = Field(None, alias="_transferSize")
     error: str | None = Field(None, alias="_error")
@@ -149,7 +129,6 @@ class HarCache(BaseModel):
     """Cache information."""
 
     before_request: dict[str, Any] | None = Field(None, alias="beforeRequest")
-    after_request: dict[str, Any] | None = Field(None, alias="afterRequest")
 
 
 class HarTimings(BaseModel):
@@ -175,34 +154,12 @@ class HarEntry(BaseModel):
     timings: HarTimings
     server_ip_address: str | None = Field(None, alias="serverIPAddress")
     connection: str | None = None
-    comment: str | None = None
-
-
-class HarPage(BaseModel):
-    """Page timing information (optional)."""
-
-    started_date_time: datetime = Field(alias="startedDateTime")
-    id: str
-    title: str
-    page_timings: dict[str, float] = Field(alias="pageTimings")
-
-
-class HarCreator(BaseModel):
-    """Tool that created the HAR."""
-
-    name: str
-    version: str
 
 
 class HarLog(BaseModel):
     """HAR log container."""
 
-    version: str
-    creator: HarCreator
-    browser: HarCreator | None = None
-    pages: list[HarPage] = Field(default_factory=list)
     entries: list[HarEntry]
-    comment: str | None = None
 
 
 class Har(BaseModel):
@@ -295,35 +252,6 @@ class ServiceFailureStats(BaseModel):
     last_seen: datetime
 
 
-class SlowRequest(BaseModel):
-    """Details of a slow request."""
-
-    url: str
-    method: str
-    duration_ms: float
-    status: int
-    size_bytes: int
-    timings: dict[str, float]
-
-
-class LargePayload(BaseModel):
-    """Details of a large payload."""
-
-    url: str
-    size_mb: float
-    content_type: str
-    cached: bool
-
-
-class RepeatedResource(BaseModel):
-    """Resource downloaded multiple times (cache issue)."""
-
-    url: str
-    count: int
-    total_bytes: int
-    size_bytes: int
-
-
 class LargeRequestBody(BaseModel):
     """Large POST/PUT request payload (>100KB)."""
 
@@ -359,7 +287,6 @@ class HarAnalysisReport(BaseModel):
     total_requests: int
     total_duration_ms: float
     total_bytes_transferred: int
-    total_bytes_downloaded: int
     overall_timings: TimingStatistics
     blocked_timings: TimingStatistics
     dns_timings: TimingStatistics
@@ -369,14 +296,8 @@ class HarAnalysisReport(BaseModel):
     ttfb_timings: TimingStatistics
     receive_timings: TimingStatistics
     status_codes: dict[int, int]
-    slowest_requests: list[SlowRequest]
-    largest_payloads: list[LargePayload]
     endpoints: list[EndpointStats]
     issues: list[DetectedIssue]
-    issues_by_severity: dict[IssueSeverity, int]
-    cache_hits: int
-    cache_misses: int
-    repeated_resources: list[RepeatedResource]
     domains: list[DomainAnalysis] = []
     service_failures: list[ServiceFailureStats] = []
     referer_hostnames: dict[str, int] = Field(default_factory=dict)
@@ -454,7 +375,6 @@ class HarAnalyzer:
             or _known_positive_bytes(e.response.body_size)
             for e in entries
         )
-        total_downloaded = sum(_known_positive_bytes(e.response.body_size) for e in entries)
 
         overall_timings = self._compute_timing_stats([e.time for e in entries])
         blocked_timings = self._compute_timing_stats(
@@ -482,12 +402,7 @@ class HarAnalyzer:
             status_codes[entry.response.status] += 1
 
         endpoints = self._aggregate_by_endpoint(entries)
-        cache_hits, cache_misses = self._compute_cache_stats(entries)
-        repeated = self._find_repeated_resources(entries)
         issues = self._detect_issues(entries, endpoints)
-        issues_by_sev = self._count_by_severity(issues)
-        slowest = self._get_slowest_requests(entries, 20)
-        largest = self._get_largest_payloads(entries, 20)
         domains = self._analyze_by_domain(entries, issues)
         service_failures = self._compute_service_failures(entries)
         referer_hostnames = self._compute_referer_hostnames(entries)
@@ -504,7 +419,6 @@ class HarAnalyzer:
             total_requests=len(entries),
             total_duration_ms=total_duration,
             total_bytes_transferred=total_transferred,
-            total_bytes_downloaded=total_downloaded,
             overall_timings=overall_timings,
             blocked_timings=blocked_timings,
             dns_timings=dns_timings,
@@ -516,12 +430,6 @@ class HarAnalyzer:
             status_codes=dict(status_codes),
             endpoints=endpoints,
             issues=issues,
-            issues_by_severity=issues_by_sev,
-            cache_hits=cache_hits,
-            cache_misses=cache_misses,
-            repeated_resources=repeated,
-            slowest_requests=slowest,
-            largest_payloads=largest,
             domains=domains,
             service_failures=service_failures,
             referer_hostnames=referer_hostnames,
@@ -954,78 +862,6 @@ class HarAnalyzer:
                 return header.value
         return "unknown"
 
-    def _find_repeated_resources(self, entries: list[HarEntry]) -> list[RepeatedResource]:
-        """Find resources downloaded multiple times."""
-        url_entries: dict[str, list[HarEntry]] = defaultdict(list)
-
-        for entry in entries:
-            url_entries[entry.request.url].append(entry)
-
-        repeated: list[RepeatedResource] = []
-        for url, reqs in url_entries.items():
-            if len(reqs) > 1:
-                total_bytes = sum(r.response.body_size for r in reqs)
-                repeated.append(
-                    RepeatedResource(
-                        url=url,
-                        count=len(reqs),
-                        total_bytes=total_bytes,
-                        size_bytes=reqs[0].response.body_size,
-                    )
-                )
-
-        return sorted(repeated, key=lambda r: r.total_bytes, reverse=True)[:20]
-
-    def _compute_cache_stats(self, entries: list[HarEntry]) -> tuple[int, int]:
-        """Count cache hits vs misses."""
-        hits = sum(1 for e in entries if e.cache and e.cache.before_request)
-        misses = len(entries) - hits
-        return hits, misses
-
-    def _get_slowest_requests(self, entries: list[HarEntry], limit: int) -> list[SlowRequest]:
-        """Get top N slowest requests."""
-        sorted_entries = sorted(entries, key=lambda e: e.time, reverse=True)[:limit]
-
-        return [
-            SlowRequest(
-                url=e.request.url,
-                method=e.request.method,
-                duration_ms=e.time,
-                status=e.response.status,
-                size_bytes=e.response.body_size,
-                timings={
-                    "blocked": e.timings.blocked,
-                    "dns": e.timings.dns,
-                    "connect": e.timings.connect,
-                    "ssl": e.timings.ssl,
-                    "send": e.timings.send,
-                    "wait": e.timings.wait,
-                    "receive": e.timings.receive,
-                },
-            )
-            for e in sorted_entries
-        ]
-
-    def _get_largest_payloads(self, entries: list[HarEntry], limit: int) -> list[LargePayload]:
-        """Get top N largest payloads."""
-        sorted_entries = sorted(entries, key=lambda e: e.response.body_size, reverse=True)[:limit]
-
-        return [
-            LargePayload(
-                url=e.request.url,
-                size_mb=e.response.body_size / 1024 / 1024,
-                content_type=self._get_content_type(e),
-                cached=e.cache is not None and e.cache.before_request is not None,
-            )
-            for e in sorted_entries
-        ]
-
-    def _count_by_severity(self, issues: list[DetectedIssue]) -> dict[IssueSeverity, int]:
-        """Count issues by severity."""
-        counts: dict[IssueSeverity, int] = defaultdict(int)
-        for issue in issues:
-            counts[issue.severity] += 1
-        return dict(counts)
 
     def _compute_service_failures(self, entries: list[HarEntry]) -> list[ServiceFailureStats]:
         """Compute backend/API service health grouped by (domain, method, path)."""

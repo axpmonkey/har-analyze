@@ -40,10 +40,6 @@ Each detected issue includes:
 
 ## Installation
 
-### Prerequisites
-
-- Python 3.11 or later
-
 ### Install uv
 
 ```bash

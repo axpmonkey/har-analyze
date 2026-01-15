@@ -1,10 +1,10 @@
 # HAR Analyzer
 
-A command-line tool for analyzing HAR (HTTP Archive) files to extract performance metrics, detect issues, and generate actionable insights for backend/API and network troubleshooting.
+A single-file command-line tool for analyzing HAR (HTTP Archive) files to extract performance metrics, detect issues, and generate actionable insights for backend/API and network troubleshooting.
 
 ## Overview
 
-HAR Analyzer parses HAR 1.2 files captured from browser developer tools or network proxies and produces comprehensive reports that help identify performance bottlenecks, service failures, and network issues.
+HAR Analyzer is a self-contained Python script (`har-analyzer.py`) that parses HAR 1.2 files captured from browser developer tools or network proxies and produces comprehensive reports that help identify performance bottlenecks, service failures, and network issues.
 
 ### Key Capabilities
 
@@ -59,7 +59,13 @@ uv sync
 ### Basic Command
 
 ```bash
-uv run har-analyzer analyze <har-file>
+uv run har-analyzer.py analyze <har-file>
+```
+
+### Show Version
+
+```bash
+uv run har-analyzer.py version
 ```
 
 ## CLI Reference
@@ -69,7 +75,7 @@ uv run har-analyzer analyze <har-file>
 Analyze a HAR file and generate performance insights.
 
 ```
-uv run har-analyzer analyze <HAR_FILE> [OPTIONS]
+uv run har-analyzer.py analyze <HAR_FILE> [OPTIONS]
 ```
 
 **Arguments:**
@@ -94,7 +100,7 @@ By default, results are displayed in the terminal with rich, colorized tables an
 Use `--export` to export the analysis as a Markdown file:
 
 ```bash
-uv run har-analyzer analyze capture.har --export report.md
+uv run har-analyzer.py analyze capture.har --export report.md
 ```
 
 ## Examples
@@ -102,31 +108,31 @@ uv run har-analyzer analyze capture.har --export report.md
 ### Analyze a HAR File with Terminal Output
 
 ```bash
-uv run har-analyzer analyze network-capture.har
+uv run har-analyzer.py analyze network-capture.har
 ```
 
 ### Export to Markdown
 
 ```bash
-uv run har-analyzer analyze network-capture.har -e analysis-report.md
+uv run har-analyzer.py analyze network-capture.har -e analysis-report.md
 ```
 
 ### Display Timestamps in Local Time
 
 ```bash
-uv run har-analyzer analyze network-capture.har --local-time
+uv run har-analyzer.py analyze network-capture.har --local-time
 ```
 
 ### Display Timestamps in a Specific Timezone
 
 ```bash
-uv run har-analyzer analyze network-capture.har --timezone America/Los_Angeles
+uv run har-analyzer.py analyze network-capture.har --timezone America/Los_Angeles
 ```
 
 ### Enable Verbose Logging
 
 ```bash
-uv run har-analyzer analyze network-capture.har --verbose
+uv run har-analyzer.py analyze network-capture.har --verbose
 ```
 
 ## Timestamp Display

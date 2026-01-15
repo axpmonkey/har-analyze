@@ -1365,10 +1365,8 @@ class OutputFormatter:
 
     def _md_header(self, har_filename: str) -> list[str]:
         lines = [f"# HAR Analysis Report: {har_filename}", ""]
-        # Add report creation timestamp
-        now = datetime.now(UTC)
-        if self._timestamp_timezone:
-            now = now.astimezone(self._timestamp_timezone)
+        # Add report creation timestamp (always in local time)
+        now = datetime.now().astimezone()
         lines.append(f"**Report Generated:** {now.isoformat(timespec='seconds')}")
         if self._timestamp_timezone_label:
             lines.append(f"**Timestamp Timezone:** {self._timestamp_timezone_label}")

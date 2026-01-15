@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HAR file analyzer - single-file version.
+"""HAR Analyze CLI.
 
 Analyze HAR files with deterministic performance insights.
 """
@@ -2059,7 +2059,7 @@ class OutputFormatter:
 # =============================================================================
 
 app = typer.Typer(
-    name="har-analyzer",
+    name="har-analyze",
     help="Analyze HAR files with deterministic performance insights",
     add_completion=False,
 )
@@ -2073,7 +2073,7 @@ def callback() -> None:
 @app.command()
 def version() -> None:
     """Show version information."""
-    typer.echo(f"har-analyzer version {__version__}")
+    typer.echo(f"har-analyze version {__version__}")
 
 
 def setup_logging(verbose: bool) -> None:

@@ -1,10 +1,10 @@
-# HAR Analyzer
+# HAR Analyze
 
-A single-file command-line tool for analyzing HAR (HTTP Archive) files to extract performance metrics, detect issues, and generate actionable insights for backend/API and network troubleshooting.
+A command-line tool for analyzing HAR (HTTP Archive) files to extract performance metrics, detect issues, and generate actionable insights for backend/API and network troubleshooting.
 
 ## Overview
 
-HAR Analyzer is a self-contained Python script (`har-analyzer.py`) that parses HAR 1.2 files captured from browser developer tools or network proxies and produces comprehensive reports that help identify performance bottlenecks, service failures, and network issues.
+HAR Analyze is a Python package that parses HAR 1.2 files captured from browser developer tools or network proxies and produces comprehensive reports that help identify performance bottlenecks, service failures, and network issues.
 
 ### Key Capabilities
 
@@ -19,7 +19,7 @@ HAR Analyzer is a self-contained Python script (`har-analyzer.py`) that parses H
 
 ### Detected Issue Types
 
-HAR Analyzer automatically detects and categorizes the following issues:
+HAR Analyze automatically detects and categorizes the following issues:
 
 | Issue Type | Severity | Description |
 |------------|----------|-------------|
@@ -50,7 +50,7 @@ Each detected issue includes:
 ```bash
 # Clone the repository
 git clone <repository-url>
-cd har-analyzer
+cd har-analyze
 
 # Install dependencies
 uv sync
@@ -61,13 +61,13 @@ uv sync
 ### Basic Command
 
 ```bash
-uv run har-analyzer.py analyze <har-file>
+uv run har-analyze analyze <har-file>
 ```
 
 ### Show Version
 
 ```bash
-uv run har-analyzer.py version
+uv run har-analyze version
 ```
 
 ## CLI Reference
@@ -77,7 +77,7 @@ uv run har-analyzer.py version
 Analyze a HAR file and generate performance insights.
 
 ```
-uv run har-analyzer.py analyze <HAR_FILE> [OPTIONS]
+uv run har-analyze analyze <HAR_FILE> [OPTIONS]
 ```
 
 **Arguments:**
@@ -102,7 +102,7 @@ By default, results are displayed in the terminal with rich, colorized tables an
 Use `--output` to export the analysis as a Markdown file:
 
 ```bash
-uv run har-analyzer.py analyze capture.har --output report.md
+uv run har-analyze analyze capture.har --output report.md
 ```
 
 ## Examples
@@ -110,31 +110,31 @@ uv run har-analyzer.py analyze capture.har --output report.md
 ### Analyze a HAR File with Terminal Output
 
 ```bash
-uv run har-analyzer.py analyze network-capture.har
+uv run har-analyze analyze network-capture.har
 ```
 
 ### Export to Markdown
 
 ```bash
-uv run har-analyzer.py analyze network-capture.har -o analysis-report.md
+uv run har-analyze analyze network-capture.har -o analysis-report.md
 ```
 
 ### Display Timestamps in Local Time
 
 ```bash
-uv run har-analyzer.py analyze network-capture.har --local-time
+uv run har-analyze analyze network-capture.har --local-time
 ```
 
 ### Display Timestamps in a Specific Timezone
 
 ```bash
-uv run har-analyzer.py analyze network-capture.har --timezone America/Los_Angeles
+uv run har-analyze analyze network-capture.har --timezone America/Los_Angeles
 ```
 
 ### Enable Verbose Logging
 
 ```bash
-uv run har-analyzer.py analyze network-capture.har --verbose
+uv run har-analyze analyze network-capture.har --verbose
 ```
 
 ## Timestamp Display

@@ -1,5 +1,5 @@
 [project]
-name = "har-analyzer"
+name = "har-analyze"
 version = "0.1.0"
 description = "HAR file analyzer with deterministic performance insights"
 readme = "README.md"
@@ -10,6 +10,9 @@ dependencies = [
     "typer>=0.9.0",
     "rich>=13.7.0",
 ]
+
+[project.scripts]
+har-analyze = "har_analyze:main"
 
 [project.optional-dependencies]
 dev = [
@@ -42,5 +45,9 @@ reportMissingTypeArgument = "error"
 reportUnnecessaryTypeIgnoreComment = "error"
 pythonVersion = "3.11"
 pythonPlatform = "All"
-include = ["har-analyzer.py"]
+include = ["src"]
 exclude = ["**/__pycache__", "**/.venv"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

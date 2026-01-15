@@ -9,11 +9,13 @@ HAR Analyzer is a self-contained Python script (`har-analyzer.py`) that parses H
 ### Key Capabilities
 
 - **Performance Metrics**: Timing percentiles (p50, p95, p99) for overall requests and broken down by phase (DNS, connect, SSL, TTFB, receive)
+- **Infrastructure Details**: HTTP version distribution, server software identification, server IP addresses by domain, connection reuse efficiency
 - **Issue Detection**: Automatic identification of network errors, HTTP 4xx/5xx responses, slow endpoints, large payloads, redirect chains, and connection blocking
 - **Domain Health Analysis**: Per-domain breakdown with error rates and health status (healthy, degraded, critical)
 - **Service Failure Tracking**: Backend/API service health grouped by domain, method, and path
+- **Time Gap Analysis**: Detection of significant gaps (>1 second) between consecutive requests indicating client-side processing delays
+- **Large Request Bodies**: Identification of large POST/PUT payloads (>100KB) that may cause upload slowness
 - **Cache Analysis**: Cache hit/miss ratios and detection of repeatedly downloaded resources
-- **Root Cause Hints**: Actionable troubleshooting suggestions for each detected issue
 
 ### Detected Issue Types
 
@@ -88,7 +90,7 @@ uv run har-analyzer.py analyze <HAR_FILE> [OPTIONS]
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--export PATH` | `-e` | Export analysis to Markdown file |
+| `--output PATH` | `-o` | Export analysis to Markdown file |
 | `--timezone ZONE` | `-t` | Convert displayed timestamps to specified timezone (e.g., `UTC`, `local`, `America/New_York`) |
 | `--local-time` | | Convert displayed timestamps to your local timezone |
 | `--verbose` | `-v` | Enable verbose logging for debugging |
@@ -97,10 +99,10 @@ uv run har-analyzer.py analyze <HAR_FILE> [OPTIONS]
 
 By default, results are displayed in the terminal with rich, colorized tables and panels.
 
-Use `--export` to export the analysis as a Markdown file:
+Use `--output` to export the analysis as a Markdown file:
 
 ```bash
-uv run har-analyzer.py analyze capture.har --export report.md
+uv run har-analyzer.py analyze capture.har --output report.md
 ```
 
 ## Examples
@@ -114,7 +116,7 @@ uv run har-analyzer.py analyze network-capture.har
 ### Export to Markdown
 
 ```bash
-uv run har-analyzer.py analyze network-capture.har -e analysis-report.md
+uv run har-analyzer.py analyze network-capture.har -o analysis-report.md
 ```
 
 ### Display Timestamps in Local Time

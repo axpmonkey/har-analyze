@@ -324,6 +324,35 @@ class RepeatedResource(BaseModel):
     size_bytes: int
 
 
+class LargeRequestBody(BaseModel):
+    """Large POST/PUT request payload (>100KB)."""
+
+    url: str
+    method: str
+    body_size_bytes: int
+    content_type: str
+    timestamp: datetime
+
+
+class TimeGap(BaseModel):
+    """Significant time gap between consecutive requests (>1 second)."""
+
+    gap_duration_ms: float
+    before_url: str
+    after_url: str
+    before_timestamp: datetime
+    after_timestamp: datetime
+
+
+class ConnectionReuseStats(BaseModel):
+    """Connection reuse efficiency statistics."""
+
+    total_requests: int
+    unique_connections: int
+    reuse_ratio: float  # requests per connection (higher = better)
+    efficiency_percent: float  # 100 * (1 - unique/total)
+
+
 class HarAnalysisReport(BaseModel):
     """Complete analysis report."""
 
@@ -351,6 +380,13 @@ class HarAnalysisReport(BaseModel):
     domains: list[DomainAnalysis] = []
     service_failures: list[ServiceFailureStats] = []
     referer_hostnames: dict[str, int] = Field(default_factory=dict)
+    # Infrastructure diagnostic fields
+    server_ips_by_domain: dict[str, list[str]] = Field(default_factory=dict)
+    http_version_distribution: dict[str, int] = Field(default_factory=dict)
+    large_request_bodies: list[LargeRequestBody] = Field(default_factory=list)
+    connection_reuse_stats: ConnectionReuseStats | None = None
+    time_gaps: list[TimeGap] = Field(default_factory=list)
+    server_software_by_domain: dict[str, dict[str, int]] = Field(default_factory=dict)
 
 
 # =============================================================================
@@ -395,6 +431,11 @@ class HarAnalyzer:
 
     DOMAIN_ERROR_RATE_CRITICAL_PCT = 50.0
     DOMAIN_ERROR_RATE_DEGRADED_PCT = 10.0
+
+    # Infrastructure diagnostic thresholds
+    LARGE_REQUEST_BODY_THRESHOLD_BYTES = 102_400  # 100KB
+    TIME_GAP_THRESHOLD_MS = 1_000  # 1 second
+    MIN_ENTRIES_FOR_GAP_ANALYSIS = 2
 
     def analyze(self, har: Har) -> HarAnalysisReport:
         """Perform comprehensive analysis of HAR data."""
@@ -451,6 +492,14 @@ class HarAnalyzer:
         service_failures = self._compute_service_failures(entries)
         referer_hostnames = self._compute_referer_hostnames(entries)
 
+        # Infrastructure diagnostics
+        server_ips_by_domain = self._compute_server_ips_by_domain(entries)
+        http_version_distribution = self._compute_http_version_distribution(entries)
+        large_request_bodies = self._compute_large_request_bodies(entries)
+        connection_reuse_stats = self._compute_connection_reuse_stats(entries)
+        time_gaps = self._compute_time_gaps(entries)
+        server_software_by_domain = self._extract_server_software_by_domain(entries)
+
         return HarAnalysisReport(
             total_requests=len(entries),
             total_duration_ms=total_duration,
@@ -476,6 +525,12 @@ class HarAnalyzer:
             domains=domains,
             service_failures=service_failures,
             referer_hostnames=referer_hostnames,
+            server_ips_by_domain=server_ips_by_domain,
+            http_version_distribution=http_version_distribution,
+            large_request_bodies=large_request_bodies,
+            connection_reuse_stats=connection_reuse_stats,
+            time_gaps=time_gaps,
+            server_software_by_domain=server_software_by_domain,
         )
 
     def _analyze_by_domain(
@@ -1051,6 +1106,137 @@ class HarAnalyzer:
 
         return sorted(results, key=sort_key)
 
+    # -------------------------------------------------------------------------
+    # Infrastructure Diagnostic Methods
+    # -------------------------------------------------------------------------
+
+    def _compute_server_ips_by_domain(
+        self, entries: list[HarEntry]
+    ) -> dict[str, list[str]]:
+        """Group unique server IP addresses by domain."""
+        by_domain: dict[str, set[str]] = defaultdict(set)
+        for entry in entries:
+            if entry.server_ip_address:
+                domain = urlparse(entry.request.url).netloc
+                by_domain[domain].add(entry.server_ip_address)
+        return {domain: sorted(ips) for domain, ips in sorted(by_domain.items())}
+
+    def _compute_http_version_distribution(
+        self, entries: list[HarEntry]
+    ) -> dict[str, int]:
+        """Count HTTP version distribution across all requests."""
+        distribution: dict[str, int] = defaultdict(int)
+        for entry in entries:
+            version = entry.request.http_version or "unknown"
+            distribution[version] += 1
+        # Sort by count descending, then alphabetically
+        return dict(sorted(distribution.items(), key=lambda kv: (-kv[1], kv[0])))
+
+    def _compute_large_request_bodies(
+        self, entries: list[HarEntry], limit: int = 20
+    ) -> list[LargeRequestBody]:
+        """Find requests with large body sizes (POST/PUT payloads >100KB)."""
+        large_bodies: list[LargeRequestBody] = []
+
+        for entry in entries:
+            if entry.request.body_size > self.LARGE_REQUEST_BODY_THRESHOLD_BYTES:
+                content_type = "unknown"
+                if entry.request.post_data:
+                    content_type = entry.request.post_data.mime_type
+
+                large_bodies.append(
+                    LargeRequestBody(
+                        url=entry.request.url,
+                        method=entry.request.method,
+                        body_size_bytes=entry.request.body_size,
+                        content_type=content_type,
+                        timestamp=entry.started_date_time,
+                    )
+                )
+
+        return sorted(large_bodies, key=lambda x: -x.body_size_bytes)[:limit]
+
+    def _compute_connection_reuse_stats(
+        self, entries: list[HarEntry]
+    ) -> ConnectionReuseStats | None:
+        """Analyze connection ID reuse efficiency."""
+        if not entries:
+            return None
+
+        connections: set[str] = set()
+        for entry in entries:
+            if entry.connection:
+                connections.add(entry.connection)
+
+        total_requests = len(entries)
+        unique_connections = len(connections) if connections else total_requests
+
+        if unique_connections == 0:
+            return None
+
+        reuse_ratio = total_requests / unique_connections
+        efficiency = (
+            100.0 * (1 - unique_connections / total_requests) if total_requests > 0 else 0.0
+        )
+
+        return ConnectionReuseStats(
+            total_requests=total_requests,
+            unique_connections=unique_connections,
+            reuse_ratio=reuse_ratio,
+            efficiency_percent=efficiency,
+        )
+
+    def _compute_time_gaps(
+        self, entries: list[HarEntry], limit: int = 20
+    ) -> list[TimeGap]:
+        """Find significant gaps (>1 second) between consecutive requests."""
+        if len(entries) < self.MIN_ENTRIES_FOR_GAP_ANALYSIS:
+            return []
+
+        # Sort entries by start time
+        sorted_entries = sorted(entries, key=lambda e: e.started_date_time)
+
+        gaps: list[TimeGap] = []
+        for i in range(1, len(sorted_entries)):
+            prev_entry = sorted_entries[i - 1]
+            curr_entry = sorted_entries[i]
+
+            gap_ms = (
+                curr_entry.started_date_time - prev_entry.started_date_time
+            ).total_seconds() * 1000
+
+            if gap_ms > self.TIME_GAP_THRESHOLD_MS:
+                gaps.append(
+                    TimeGap(
+                        gap_duration_ms=gap_ms,
+                        before_url=prev_entry.request.url,
+                        after_url=curr_entry.request.url,
+                        before_timestamp=prev_entry.started_date_time,
+                        after_timestamp=curr_entry.started_date_time,
+                    )
+                )
+
+        return sorted(gaps, key=lambda x: -x.gap_duration_ms)[:limit]
+
+    def _extract_server_software_by_domain(
+        self, entries: list[HarEntry]
+    ) -> dict[str, dict[str, int]]:
+        """Extract Server header values grouped by domain."""
+        by_domain: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+        for entry in entries:
+            domain = urlparse(entry.request.url).netloc
+            for header in entry.response.headers:
+                if header.name.lower() == "server":
+                    by_domain[domain][header.value] += 1
+                    break
+
+        # Convert defaultdicts to regular dicts, sorted
+        return {
+            domain: dict(sorted(servers.items(), key=lambda kv: (-kv[1], kv[0])))
+            for domain, servers in sorted(by_domain.items())
+        }
+
 
 # =============================================================================
 # Output Formatter
@@ -1065,6 +1251,21 @@ ISSUES_BY_DOMAIN_MAX_DOMAINS = 15
 ISSUES_BY_DOMAIN_MAX_ISSUES = 8
 MARKDOWN_MAX_ISSUES_PER_SEVERITY = 50
 MARKDOWN_TOP_ENDPOINTS = 10
+
+# Infrastructure diagnostics display limits
+SERVER_IPS_TABLE_MAX_ROWS = 15
+TIME_GAP_TABLE_MAX_ROWS = 10
+LARGE_REQUEST_BODY_TABLE_MAX_ROWS = 10
+SERVER_SOFTWARE_MAX_DOMAINS = 10
+
+# Path truncation limits for display
+PATH_TRUNCATE_LONG = 80
+PATH_TRUNCATE_MEDIUM = 60
+PATH_TRUNCATE_SHORT = 50
+PATH_TRUNCATE_TINY = 40
+
+# Byte size thresholds
+ONE_MEGABYTE = 1_048_576
 
 
 class OutputFormatter:
@@ -1082,15 +1283,37 @@ class OutputFormatter:
 
     def print_report(self, report: HarAnalysisReport) -> None:
         """Print a backend/network-focused report to the terminal."""
+        # SECTION 1: METADATA & INFRASTRUCTURE
         self._print_summary(report)
         console.print()
 
-        if report.domains:
-            self._print_domain_health(report)
+        # Infrastructure details panel (HTTP versions, server software, connection reuse)
+        self._print_infrastructure_details(report)
+        console.print()
+
+        # Server IPs table
+        if report.server_ips_by_domain:
+            self._print_server_ips_table(report)
             console.print()
 
+        # Time gaps table
+        if report.time_gaps:
+            self._print_time_gaps_table(report)
+            console.print()
+
+        # Large request bodies table
+        if report.large_request_bodies:
+            self._print_large_request_bodies_table(report)
+            console.print()
+
+        # Referer hostnames
         if report.referer_hostnames:
             self._print_referer_hostnames(report)
+            console.print()
+
+        # SECTION 2: PROBLEM ANALYSIS
+        if report.domains:
+            self._print_domain_health(report)
             console.print()
 
         if report.service_failures:
@@ -1116,9 +1339,12 @@ class OutputFormatter:
     def generate_markdown_report(self, report: HarAnalysisReport, har_filename: str) -> str:
         """Generate a factual markdown report."""
         lines: list[str] = []
+        # SECTION 1: METADATA & INFRASTRUCTURE
         lines.extend(self._md_header(har_filename))
         lines.extend(self._md_hostnames(report))
         lines.extend(self._md_summary(report))
+        lines.extend(self._md_infrastructure_details(report))
+        # SECTION 2: PROBLEM ANALYSIS
         lines.extend(self._md_domain_health(report))
         lines.extend(self._md_service_health(report))
         lines.extend(self._md_outages(report))
@@ -1139,9 +1365,14 @@ class OutputFormatter:
 
     def _md_header(self, har_filename: str) -> list[str]:
         lines = [f"# HAR Analysis Report: {har_filename}", ""]
+        # Add report creation timestamp
+        now = datetime.now(UTC)
+        if self._timestamp_timezone:
+            now = now.astimezone(self._timestamp_timezone)
+        lines.append(f"**Report Generated:** {now.isoformat(timespec='seconds')}")
         if self._timestamp_timezone_label:
-            lines.extend([f"**Timestamp Timezone:** {self._timestamp_timezone_label}", ""])
-        lines.extend(["---", ""])
+            lines.append(f"**Timestamp Timezone:** {self._timestamp_timezone_label}")
+        lines.extend(["", "---", ""])
         return lines
 
     def _md_hostnames(self, report: HarAnalysisReport) -> list[str]:
@@ -1221,7 +1452,7 @@ class OutputFormatter:
         return lines
 
     def _md_referer_hostnames(self, report: HarAnalysisReport) -> list[str]:
-        lines = ["### Referer Hostnames (from request headers)", ""]
+        lines = ["### Referer Hostnames", ""]
         for hostname, count in list(report.referer_hostnames.items())[:10]:
             lines.append(f"- `{hostname}`: {count:,}")
         lines.append("")
@@ -1258,7 +1489,7 @@ class OutputFormatter:
         failing = self._failing_services(report.service_failures)
         if not failing:
             return []
-        lines = ["## Backend/API Service Health (Factual)", ""]
+        lines = ["## Backend/API Service Health", ""]
         lines.append(
             "| Domain | Method | Path | Req | OK | NetErr | 5xx | 4xx | >30s | "
             "ProblemRate | p95 total | p95 TTFB | p95 net |"
@@ -1345,7 +1576,7 @@ class OutputFormatter:
         ]
         if not filtered_endpoints:
             return []
-        lines = ["## Top 10 Slowest Endpoints (Attribution)", ""]
+        lines = ["## Top 10 Slowest Endpoints", ""]
         lines.append("| Endpoint Path | Count | p95 total | p95 TTFB | p95 net | Dominant |")
         lines.append("|---------------|-------|----------|----------|--------|----------|")
         for endpoint in filtered_endpoints[:MARKDOWN_TOP_ENDPOINTS]:
@@ -1386,18 +1617,21 @@ class OutputFormatter:
 
         summary_lines: list[str] = [*hostname_lines]
         summary_lines.append(f"**Total Requests:** {report.total_requests:,}")
+        summary_lines.append("")
         summary_lines.append(f"**Total Duration:** {report.total_duration_ms / 1000:.1f}s")
+        summary_lines.append("")
         if capture_start and capture_end:
             summary_lines.append(
                 "**Capture Window:** "
                 f"{self._format_timestamp(capture_start)} → {self._format_timestamp(capture_end)}"
             )
+            summary_lines.append("")
         if self._timestamp_timezone_label:
             summary_lines.append(f"**Timestamp Timezone:** {self._timestamp_timezone_label}")
+            summary_lines.append("")
         summary_lines.append(f"**Total Transferred (best-effort):** {total_transferred_mb:.1f} MB")
         summary_lines.extend(
             [
-                "**Focus:** Backend/API & network diagnostics",
                 "",
                 "**Timing Percentiles (p50 / p95 / p99):**",
                 self._format_timing_line("Overall", report.overall_timings),
@@ -1537,7 +1771,7 @@ class OutputFormatter:
         if not failing:
             return
 
-        table = Table(title="Backend/API Service Health (Factual)")
+        table = Table(title="Backend/API Service Health")
         table.add_column("Domain", style="cyan", no_wrap=False)
         table.add_column("Method", style="cyan", no_wrap=True)
         table.add_column("Path", style="cyan", no_wrap=False)
@@ -1649,7 +1883,7 @@ class OutputFormatter:
         if not filtered:
             return
 
-        table = Table(title="Top 10 Slowest Endpoints (Attribution)")
+        table = Table(title="Top 10 Slowest Endpoints")
         table.add_column("Endpoint Path", style="cyan", no_wrap=False)
         table.add_column("Count", justify="right")
         table.add_column("p95 total", justify="right", style="yellow")
@@ -1676,7 +1910,7 @@ class OutputFormatter:
         console.print(table)
 
     def _print_referer_hostnames(self, report: HarAnalysisReport) -> None:
-        table = Table(title="Referer Hostnames (from request headers)")
+        table = Table(title="Referer Hostnames")
         table.add_column("Referer Hostname", style="cyan", no_wrap=False)
         table.add_column("Requests", justify="right")
 
@@ -1766,6 +2000,225 @@ class OutputFormatter:
         static_prefixes = ("/images/", "/styles/", "/static/", "/assets/", "/fonts/")
         return path_lower.startswith(static_prefixes)
 
+    # -------------------------------------------------------------------------
+    # Infrastructure Details (Terminal)
+    # -------------------------------------------------------------------------
+
+    def _print_infrastructure_details(self, report: HarAnalysisReport) -> None:
+        """Print infrastructure and metadata details panel."""
+        lines: list[str] = []
+
+        # HTTP Version Distribution
+        if report.http_version_distribution:
+            lines.append("**HTTP Versions:**")
+            for version, count in report.http_version_distribution.items():
+                pct = 100 * count / report.total_requests if report.total_requests else 0
+                lines.append(f"- {version}: {count:,} ({pct:.1f}%)")
+            lines.append("")
+
+        # Server Software (condensed)
+        if report.server_software_by_domain:
+            lines.append("**Server Software:**")
+            for domain, servers in list(report.server_software_by_domain.items())[
+                :SERVER_SOFTWARE_MAX_DOMAINS
+            ]:
+                server_str = ", ".join(f"{s} ({c})" for s, c in servers.items())
+                lines.append(f"- `{domain}`: {server_str}")
+            if len(report.server_software_by_domain) > SERVER_SOFTWARE_MAX_DOMAINS:
+                remaining = len(report.server_software_by_domain) - SERVER_SOFTWARE_MAX_DOMAINS
+                lines.append(f"- *... and {remaining} more domains*")
+            lines.append("")
+
+        # Connection Reuse
+        if report.connection_reuse_stats:
+            stats = report.connection_reuse_stats
+            lines.append("**Connection Reuse:**")
+            lines.append(f"- Unique connections: {stats.unique_connections:,}")
+            lines.append(f"- Requests per connection: {stats.reuse_ratio:.1f}")
+            lines.append(f"- Reuse efficiency: {stats.efficiency_percent:.1f}%")
+            lines.append("")
+
+        if lines:
+            console.print(
+                Panel(
+                    Markdown("\n".join(lines)),
+                    title="[bold cyan]Infrastructure Details[/bold cyan]",
+                    border_style="cyan",
+                )
+            )
+
+    def _print_server_ips_table(self, report: HarAnalysisReport) -> None:
+        """Print server IPs by domain as a table."""
+        if not report.server_ips_by_domain:
+            return
+
+        table = Table(title="Server IP Addresses by Domain")
+        table.add_column("Domain", style="cyan", no_wrap=False)
+        table.add_column("Server IPs", style="green", no_wrap=False)
+
+        for domain, ips in list(report.server_ips_by_domain.items())[
+            :SERVER_IPS_TABLE_MAX_ROWS
+        ]:
+            table.add_row(domain, ", ".join(ips))
+
+        if len(report.server_ips_by_domain) > SERVER_IPS_TABLE_MAX_ROWS:
+            remaining = len(report.server_ips_by_domain) - SERVER_IPS_TABLE_MAX_ROWS
+            table.add_row(f"... and {remaining} more", "", style="dim")
+
+        console.print(table)
+
+    def _print_time_gaps_table(self, report: HarAnalysisReport) -> None:
+        """Print significant time gaps between requests."""
+        if not report.time_gaps:
+            return
+
+        table = Table(title="Significant Time Gaps (>1s)")
+        table.add_column("Gap", style="yellow", justify="right")
+        table.add_column("After Request", style="cyan", no_wrap=False)
+        table.add_column("Timestamp", style="dim")
+
+        for gap in report.time_gaps[:TIME_GAP_TABLE_MAX_ROWS]:
+            path = self._extract_path(gap.after_url)
+            gap_seconds = gap.gap_duration_ms / 1000
+            table.add_row(
+                f"{gap_seconds:.1f}s",
+                path[:PATH_TRUNCATE_LONG] if len(path) > PATH_TRUNCATE_LONG else path,
+                self._format_timestamp(gap.after_timestamp, timespec="seconds"),
+            )
+
+        if len(report.time_gaps) > TIME_GAP_TABLE_MAX_ROWS:
+            remaining = len(report.time_gaps) - TIME_GAP_TABLE_MAX_ROWS
+            table.add_row(f"... and {remaining} more", "", "", style="dim")
+
+        console.print(table)
+
+    def _print_large_request_bodies_table(self, report: HarAnalysisReport) -> None:
+        """Print large request bodies (POST/PUT payloads)."""
+        if not report.large_request_bodies:
+            return
+
+        table = Table(title="Large Request Bodies (>100KB)")
+        table.add_column("Size", style="yellow", justify="right")
+        table.add_column("Method", style="cyan")
+        table.add_column("URL Path", style="cyan", no_wrap=False)
+        table.add_column("Content-Type", style="dim")
+
+        for body in report.large_request_bodies[:LARGE_REQUEST_BODY_TABLE_MAX_ROWS]:
+            path = self._extract_path(body.url)
+            if body.body_size_bytes >= ONE_MEGABYTE:
+                size_str = f"{body.body_size_bytes / ONE_MEGABYTE:.1f} MB"
+            else:
+                size_str = f"{body.body_size_bytes / 1024:.1f} KB"
+
+            table.add_row(
+                size_str,
+                body.method,
+                path[:PATH_TRUNCATE_MEDIUM] if len(path) > PATH_TRUNCATE_MEDIUM else path,
+                body.content_type[:30] if body.content_type else "-",
+            )
+
+        if len(report.large_request_bodies) > LARGE_REQUEST_BODY_TABLE_MAX_ROWS:
+            remaining = len(report.large_request_bodies) - LARGE_REQUEST_BODY_TABLE_MAX_ROWS
+            table.add_row(f"... and {remaining} more", "", "", "", style="dim")
+
+        console.print(table)
+
+    # -------------------------------------------------------------------------
+    # Infrastructure Details (Markdown)
+    # -------------------------------------------------------------------------
+
+    def _md_infrastructure_details(self, report: HarAnalysisReport) -> list[str]:
+        """Generate markdown for infrastructure details section."""
+        lines: list[str] = ["## Infrastructure Details", ""]
+
+        # HTTP Version Distribution
+        if report.http_version_distribution:
+            lines.append("### HTTP Versions")
+            lines.append("")
+            for version, count in report.http_version_distribution.items():
+                pct = 100 * count / report.total_requests if report.total_requests else 0
+                lines.append(f"- **{version}:** {count:,} ({pct:.1f}%)")
+            lines.append("")
+
+        # Server Software by Domain
+        if report.server_software_by_domain:
+            lines.append("### Server Software by Domain")
+            lines.append("")
+            lines.append("| Domain | Server Software |")
+            lines.append("|--------|-----------------|")
+            for domain, servers in list(report.server_software_by_domain.items())[
+                :SERVER_SOFTWARE_MAX_DOMAINS
+            ]:
+                server_str = ", ".join(f"{s} ({c})" for s, c in servers.items())
+                lines.append(f"| `{domain}` | {server_str} |")
+            lines.append("")
+
+        # Server IPs by Domain
+        if report.server_ips_by_domain:
+            lines.append("### Server IP Addresses by Domain")
+            lines.append("")
+            lines.append("| Domain | IPs |")
+            lines.append("|--------|-----|")
+            for domain, ips in list(report.server_ips_by_domain.items())[
+                :SERVER_IPS_TABLE_MAX_ROWS
+            ]:
+                lines.append(f"| `{domain}` | {', '.join(ips)} |")
+            lines.append("")
+
+        # Connection Reuse Stats
+        if report.connection_reuse_stats:
+            stats = report.connection_reuse_stats
+            lines.append("### Connection Reuse")
+            lines.append("")
+            lines.append(f"- **Unique connections:** {stats.unique_connections:,}")
+            lines.append(f"- **Requests per connection:** {stats.reuse_ratio:.1f}")
+            lines.append(f"- **Reuse efficiency:** {stats.efficiency_percent:.1f}%")
+            lines.append("")
+
+        # Time Gaps
+        if report.time_gaps:
+            lines.append("### Significant Time Gaps (>1 second)")
+            lines.append("")
+            lines.append("| Gap | After Request | Timestamp |")
+            lines.append("|-----|---------------|-----------|")
+            for gap in report.time_gaps[:TIME_GAP_TABLE_MAX_ROWS]:
+                path = self._extract_path(gap.after_url)
+                gap_seconds = gap.gap_duration_ms / 1000
+                ts = self._format_timestamp(gap.after_timestamp, timespec="seconds")
+                truncated_path = (
+                    path[:PATH_TRUNCATE_SHORT] if len(path) > PATH_TRUNCATE_SHORT else path
+                )
+                lines.append(f"| {gap_seconds:.1f}s | `{truncated_path}` | `{ts}` |")
+            lines.append("")
+
+        # Large Request Bodies
+        lines.extend(self._md_large_request_bodies(report))
+
+        return lines
+
+    def _md_large_request_bodies(self, report: HarAnalysisReport) -> list[str]:
+        """Generate markdown for large request bodies section."""
+        if not report.large_request_bodies:
+            return []
+
+        lines: list[str] = [
+            "### Large Request Bodies (>100KB)",
+            "",
+            "| Size | Method | Path | Content-Type |",
+            "|------|--------|------|--------------|",
+        ]
+        for body in report.large_request_bodies[:LARGE_REQUEST_BODY_TABLE_MAX_ROWS]:
+            path = self._extract_path(body.url)
+            if body.body_size_bytes >= ONE_MEGABYTE:
+                size_str = f"{body.body_size_bytes / ONE_MEGABYTE:.1f} MB"
+            else:
+                size_str = f"{body.body_size_bytes / 1024:.1f} KB"
+            truncated_path = path[:PATH_TRUNCATE_TINY] if len(path) > PATH_TRUNCATE_TINY else path
+            content_type = body.content_type[:25] if body.content_type else "-"
+            lines.append(f"| {size_str} | `{body.method}` | `{truncated_path}` | {content_type} |")
+        lines.append("")
+        return lines
+
 
 # =============================================================================
 # CLI
@@ -1781,7 +2234,6 @@ app = typer.Typer(
 @app.callback()
 def callback() -> None:
     """HAR file analyzer with deterministic performance insights."""
-    pass
 
 
 @app.command()
@@ -1833,8 +2285,8 @@ def analyze(
     har_file: Path = typer.Argument(  # noqa: B008
         ..., exists=True, file_okay=True, dir_okay=False, readable=True, help="Path to HAR file"
     ),
-    export: Path | None = typer.Option(  # noqa: B008
-        None, "--export", "-e", help="Export analysis to Markdown file"
+    output: Path | None = typer.Option(  # noqa: B008
+        None, "--output", "-o", help="Export analysis to Markdown file"
     ),
     timezone: str | None = typer.Option(
         None,
@@ -1873,10 +2325,10 @@ def analyze(
             timestamp_timezone_label=timestamp_timezone_label,
         )
 
-        if export:
+        if output:
             markdown_content = formatter.generate_markdown_report(report, har_file.name)
-            export.write_text(markdown_content, encoding="utf-8")
-            typer.echo(f"Markdown report exported to: {export}")
+            output.write_text(markdown_content, encoding="utf-8")
+            typer.echo(f"Markdown report exported to: {output}")
         else:
             formatter.print_report(report)
 

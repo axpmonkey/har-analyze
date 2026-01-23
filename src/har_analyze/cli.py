@@ -113,6 +113,7 @@ class HarRequest(BaseModel):
     body_size: int = Field(alias="bodySize")
     post_data: HarPostData | None = Field(None, alias="postData")
 
+
 class HarResponse(BaseModel):
     """HTTP response."""
 
@@ -862,7 +863,6 @@ class HarAnalyzer:
                 return header.value
         return "unknown"
 
-
     def _compute_service_failures(self, entries: list[HarEntry]) -> list[ServiceFailureStats]:
         """Compute backend/API service health grouped by (domain, method, path)."""
         by_service: dict[tuple[str, str, str], list[HarEntry]] = defaultdict(list)
@@ -946,9 +946,7 @@ class HarAnalyzer:
     # Infrastructure Diagnostic Methods
     # -------------------------------------------------------------------------
 
-    def _compute_server_ips_by_domain(
-        self, entries: list[HarEntry]
-    ) -> dict[str, list[str]]:
+    def _compute_server_ips_by_domain(self, entries: list[HarEntry]) -> dict[str, list[str]]:
         """Group unique server IP addresses by domain."""
         by_domain: dict[str, set[str]] = defaultdict(set)
         for entry in entries:
@@ -957,9 +955,7 @@ class HarAnalyzer:
                 by_domain[domain].add(entry.server_ip_address)
         return {domain: sorted(ips) for domain, ips in sorted(by_domain.items())}
 
-    def _compute_http_version_distribution(
-        self, entries: list[HarEntry]
-    ) -> dict[str, int]:
+    def _compute_http_version_distribution(self, entries: list[HarEntry]) -> dict[str, int]:
         """Count HTTP version distribution across all requests."""
         distribution: dict[str, int] = defaultdict(int)
         for entry in entries:
@@ -1022,9 +1018,7 @@ class HarAnalyzer:
             efficiency_percent=efficiency,
         )
 
-    def _compute_time_gaps(
-        self, entries: list[HarEntry], limit: int = 20
-    ) -> list[TimeGap]:
+    def _compute_time_gaps(self, entries: list[HarEntry], limit: int = 20) -> list[TimeGap]:
         """Find significant gaps (>1 second) between consecutive requests."""
         if len(entries) < self.MIN_ENTRIES_FOR_GAP_ANALYSIS:
             return []
@@ -1890,9 +1884,7 @@ class OutputFormatter:
         table.add_column("Domain", style="cyan", no_wrap=False)
         table.add_column("Server IPs", style="green", no_wrap=False)
 
-        for domain, ips in list(report.server_ips_by_domain.items())[
-            :SERVER_IPS_TABLE_MAX_ROWS
-        ]:
+        for domain, ips in list(report.server_ips_by_domain.items())[:SERVER_IPS_TABLE_MAX_ROWS]:
             table.add_row(domain, ", ".join(ips))
 
         if len(report.server_ips_by_domain) > SERVER_IPS_TABLE_MAX_ROWS:

@@ -1,13 +1,15 @@
 # AGENTS.md
 
-Guardrails for coding/auditing agents (Claude Code, OpenAI Codex, and similar). Concise and normative.
+Guardrails for coding/auditing agents (Claude Code, OpenAI Codex, and similar). Self-contained and normative.
+
+**Project**: Python package template and agent configuration files for consistent, high-quality Python development.
 
 ---
 
 ## Core Rules
 
 - **Plan first**: Draft a short plan (bullets) and emit it before any code changes.
-- **Docs first**: Use Context7 MCP to resolve library IDs and retrieve docs before generating code that uses external libraries.
+- **Docs first**: Use Context7 MCP (or equivalent) to resolve library IDs and retrieve docs before generating code that uses external libraries.
 - **Minimal edits**: Prefer minimal, reversible changes. Do not change public APIs or file layout unless explicitly requested.
 - **Determinism**: All code and tests must be deterministic (no network, no nondeterministic time unless frozen).
 - **Escalate**: Stop and escalate (open an issue or produce a note) if a task conflicts with these rules, requires API/layout changes without permission, or if required tools/docs are unavailable.
@@ -31,44 +33,15 @@ Guardrails for coding/auditing agents (Claude Code, OpenAI Codex, and similar). 
 - **Python**: 3.11-3.13
 - **Formatter/Linter**: `ruff format` and `ruff check --fix`
 - **Type checker**: `basedpyright` (strict)
-- **Tests**: `pytest` with branch coverage ≥90%; optional `hypothesis`
+- **Tests**: `pytest` with branch coverage >= 90%; optional `hypothesis`
 - **Packaging**: `pyproject.toml` as single source of truth; `uv` exclusively (no pip/poetry/conda)
 - **Bash tools**: `rg`, `fd`, `bat`, `jq` only (no grep/find)
 
 ---
 
-## Configuration Reference
+## Verification
 
-Single `pyproject.toml` defines all tool settings:
-
-```toml
-[project]
-requires-python = ">=3.11"
-
-[tool.ruff]
-target-version = "py311"
-line-length = 100
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "PERF", "PTH", "PL", "PIE", "RUF", "Q", "D"]
-
-[tool.ruff.lint.pydocstyle]
-convention = "google"  # or "numpy"
-
-[tool.basedpyright]
-typeCheckingMode = "strict"
-reportUnknownParameterType = "error"
-reportUnknownMemberType = "error"
-reportUnknownVariableType = "error"
-reportMissingTypeArgument = "error"
-reportUnnecessaryTypeIgnoreComment = "error"
-```
-
----
-
-## CI Gates
-
-Run in sequence; all must pass:
+Run in sequence; **all must pass** before committing:
 
 ```bash
 uv sync --frozen
@@ -90,7 +63,7 @@ Matrix across Python 3.11-3.13. Cache `uv` environments. Commit `uv.lock`.
 ```
 src/<package_name>/    # All package code
 tests/                 # All tests (outside src/)
-pyproject.toml         # Single config file
+pyproject.toml         # Single config file (all tool settings live here)
 uv.lock                # Committed lockfile
 ```
 
@@ -106,7 +79,7 @@ uv.lock                # Committed lockfile
 - Complete type hints on all code; `from __future__ import annotations`.
 - No implicit `Any`. No `# type: ignore` without justification.
 - Prefer `Protocol` for behavioral contracts; use `Self`, `ParamSpec`, `TypeVarTuple` as appropriate.
-- PEP 695 syntax when minimum version is ≥3.12; otherwise `TypeVar`/`ParamSpec`.
+- PEP 695 syntax when minimum version is >= 3.12; otherwise `TypeVar`/`ParamSpec`.
 
 ### I/O & HTTP
 - Use `pathlib.Path` for filesystem work.
@@ -146,7 +119,7 @@ uv.lock                # Committed lockfile
 - Hermetic and network-free by default.
 - Mock HTTP with `respx` or `httpx` mocking.
 - Freeze time (`time-machine`/`freezegun`), seed randomness, enforce per-test timeouts.
-- Branch coverage ≥90%.
+- Branch coverage >= 90%.
 - Test deprecation warnings with `warnings.warn(..., DeprecationWarning, stacklevel=2)`.
 
 ---

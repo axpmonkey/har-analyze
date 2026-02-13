@@ -12,7 +12,7 @@ import json
 import logging
 import statistics
 from collections import defaultdict
-from datetime import UTC, datetime, tzinfo
+from datetime import UTC, datetime, timedelta, tzinfo
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -52,6 +52,7 @@ class IssueType(str, Enum):
     DURATION_EXCEEDED = "duration_exceeded"
     SERVER_ERROR = "server_error"
     CLIENT_ERROR = "client_error"
+    RATE_LIMITED = "rate_limited"
     LARGE_PAYLOAD = "large_payload"
     SLOW_ENDPOINT = "slow_endpoint"
     BLOCKING = "blocking"
@@ -212,6 +213,7 @@ class DomainAnalysis(BaseModel):
     issue_count: int
     health: DomainHealth
     is_first_party: bool
+    dominant_bottleneck: str = ""  # "server", "network", or "client"
 
 
 class EndpointStats(BaseModel):
@@ -252,6 +254,19 @@ class ServiceFailureStats(BaseModel):
     first_seen: datetime
     last_seen: datetime
 
+    @property
+    def problem_rate(self) -> float:
+        """Fraction of requests that had any problem (0.0 to 1.0)."""
+        if self.request_count == 0:
+            return 0.0
+        problem_count = (
+            self.network_error_count
+            + self.status_5xx_count
+            + self.status_4xx_count
+            + self.duration_exceeded_count
+        )
+        return problem_count / self.request_count
+
 
 class LargeRequestBody(BaseModel):
     """Large POST/PUT request payload (>100KB)."""
@@ -282,6 +297,59 @@ class ConnectionReuseStats(BaseModel):
     efficiency_percent: float  # 100 * (1 - unique/total)
 
 
+class PhaseBreakdown(BaseModel):
+    """Time breakdown by request phase."""
+
+    phase_name: str
+    total_ms: float
+    percentage_of_total: float
+
+
+class CompressionAnalysis(BaseModel):
+    """Compression analysis results."""
+
+    encoding_distribution: dict[str, int]  # e.g. {"gzip": 50, "br": 20, "none": 30}
+    compressible_uncompressed_count: int
+    compressible_uncompressed_bytes: int
+    total_responses_analyzed: int
+
+
+class CacheAnalysis(BaseModel):
+    """Cache analysis results."""
+
+    total_cacheable_requests: int
+    cache_hit_count: int  # 304 responses
+    cache_miss_count: int  # 200 responses for same URL seen multiple times
+    repeated_downloads: list[dict[str, Any]]  # [{url, count, total_bytes}]
+    missing_cache_control_count: int
+    cache_hit_ratio: float  # 0.0 to 1.0
+
+
+class ErrorBurst(BaseModel):
+    """A cluster of errors within a short time window."""
+
+    start_time: datetime
+    end_time: datetime
+    error_count: int
+    affected_domains: list[str]
+
+
+class RequestRateStats(BaseModel):
+    """Request rate statistics."""
+
+    overall_requests_per_second: float
+    peak_requests_per_second: float
+
+
+class KeyFinding(BaseModel):
+    """A synthesized key finding from the analysis."""
+
+    category: str  # "outage", "bottleneck", "protocol", "dns", "compression", etc.
+    severity: IssueSeverity
+    summary: str
+    recommendation: str
+
+
 class HarAnalysisReport(BaseModel):
     """Complete analysis report."""
 
@@ -309,27 +377,14 @@ class HarAnalysisReport(BaseModel):
     connection_reuse_stats: ConnectionReuseStats | None = None
     time_gaps: list[TimeGap] = Field(default_factory=list)
     server_software_by_domain: dict[str, dict[str, int]] = Field(default_factory=dict)
-
-
-# =============================================================================
-# Time Utils
-# =============================================================================
-
-
-def capture_window(report: HarAnalysisReport) -> tuple[datetime | None, datetime | None]:
-    """Return the earliest and latest timestamps observed in the report."""
-    timestamps: list[datetime] = []
-    for service in report.service_failures:
-        timestamps.append(service.first_seen)
-        timestamps.append(service.last_seen)
-    timestamps.extend([issue.timestamp for issue in report.issues])
-
-    if not timestamps:
-        return None, None
-
-    aware = [ts for ts in timestamps if ts.tzinfo is not None]
-    chosen = aware if aware else timestamps
-    return min(chosen), max(chosen)
+    capture_start: datetime | None = None
+    capture_end: datetime | None = None
+    phase_breakdown: list[PhaseBreakdown] = Field(default_factory=list)
+    compression_analysis: CompressionAnalysis | None = None
+    cache_analysis: CacheAnalysis | None = None
+    error_bursts: list[ErrorBurst] = Field(default_factory=list)
+    request_rate_stats: RequestRateStats | None = None
+    key_findings: list[KeyFinding] = Field(default_factory=list)
 
 
 # =============================================================================
@@ -343,6 +398,7 @@ class HarAnalyzer:
     HTTP_STATUS_SUCCESS_MIN = 200
     HTTP_STATUS_REDIRECT_MAX = 400
     HTTP_STATUS_CLIENT_ERROR_MIN = 400
+    HTTP_STATUS_RATE_LIMITED = 429
     HTTP_STATUS_SERVER_ERROR_MIN = 500
     HTTP_STATUS_ERROR_MAX = 600
 
@@ -416,7 +472,50 @@ class HarAnalyzer:
         time_gaps = self._compute_time_gaps(entries)
         server_software_by_domain = self._extract_server_software_by_domain(entries)
 
-        return HarAnalysisReport(
+        # Compression & cache analysis
+        compression_analysis = self._analyze_compression(entries)
+        cache_analysis = self._analyze_caching(entries)
+
+        # Error bursts
+        error_bursts = self._detect_error_bursts(issues)
+
+        # Capture window from entry timestamps
+        capture_start: datetime | None = None
+        capture_end: datetime | None = None
+        if entries:
+            timestamps = [e.started_date_time for e in entries]
+            aware = [ts for ts in timestamps if ts.tzinfo is not None]
+            chosen = aware if aware else timestamps
+            capture_start = min(chosen)
+            capture_end = max(chosen)
+
+        # Request rate
+        request_rate_stats = self._compute_request_rate(entries, capture_start, capture_end)
+
+        # Phase breakdown
+        phase_totals = {
+            "Blocked": blocked_timings.total_duration_ms,
+            "DNS": dns_timings.total_duration_ms,
+            "Connect": connect_timings.total_duration_ms,
+            "SSL": ssl_timings.total_duration_ms,
+            "Send": send_timings.total_duration_ms,
+            "TTFB": ttfb_timings.total_duration_ms,
+            "Receive": receive_timings.total_duration_ms,
+        }
+        phase_grand_total = sum(phase_totals.values())
+        phase_breakdown = [
+            PhaseBreakdown(
+                phase_name=name,
+                total_ms=total_ms,
+                percentage_of_total=(total_ms / phase_grand_total * 100)
+                if phase_grand_total
+                else 0,
+            )
+            for name, total_ms in phase_totals.items()
+        ]
+        phase_breakdown.sort(key=lambda p: -p.percentage_of_total)
+
+        report = HarAnalysisReport(
             total_requests=len(entries),
             total_duration_ms=total_duration,
             total_bytes_transferred=total_transferred,
@@ -440,7 +539,16 @@ class HarAnalyzer:
             connection_reuse_stats=connection_reuse_stats,
             time_gaps=time_gaps,
             server_software_by_domain=server_software_by_domain,
+            capture_start=capture_start,
+            capture_end=capture_end,
+            phase_breakdown=phase_breakdown,
+            compression_analysis=compression_analysis,
+            cache_analysis=cache_analysis,
+            error_bursts=error_bursts,
+            request_rate_stats=request_rate_stats,
         )
+        report.key_findings = self._generate_key_findings(report)
+        return report
 
     def _analyze_by_domain(
         self, entries: list[HarEntry], issues: list[DetectedIssue]
@@ -491,6 +599,27 @@ class HarAnalyzer:
             else:
                 health = DomainHealth.HEALTHY
 
+            # Compute per-domain bottleneck classification
+            ttfb_total = sum(e.timings.wait for e in domain_entries if e.timings.wait >= 0)
+            network_total = sum(
+                (e.timings.dns if e.timings.dns >= 0 else 0.0)
+                + (e.timings.connect if e.timings.connect >= 0 else 0.0)
+                + (e.timings.ssl if e.timings.ssl >= 0 else 0.0)
+                + (e.timings.receive if e.timings.receive >= 0 else 0.0)
+                for e in domain_entries
+            )
+            client_total = sum(
+                (e.timings.blocked if e.timings.blocked >= 0 else 0.0)
+                + (e.timings.send if e.timings.send >= 0 else 0.0)
+                for e in domain_entries
+            )
+            bottleneck_map = {
+                "server": ttfb_total,
+                "network": network_total,
+                "client": client_total,
+            }
+            dominant_bottleneck = max(bottleneck_map, key=lambda k: bottleneck_map[k])
+
             domain_analyses.append(
                 DomainAnalysis(
                     domain=domain,
@@ -502,6 +631,7 @@ class HarAnalyzer:
                     issue_count=len(domain_issues),
                     health=health,
                     is_first_party=(domain == first_party_domain),
+                    dominant_bottleneck=dominant_bottleneck,
                 )
             )
 
@@ -703,6 +833,20 @@ class HarAnalyzer:
                         message=f"Server error: {status} {entry.response.status_text}",
                         timestamp=entry.started_date_time,
                         duration_ms=entry.time,
+                        details={"status": status, "method": entry.request.method},
+                        domain=domain,
+                    )
+                )
+                self._maybe_add_referer_hostname(issues[-1].details, entry)
+            elif status == self.HTTP_STATUS_RATE_LIMITED:
+                domain = urlparse(entry.request.url).netloc
+                issues.append(
+                    DetectedIssue(
+                        issue_type=IssueType.RATE_LIMITED,
+                        severity=IssueSeverity.HIGH,
+                        url=entry.request.url,
+                        message="Rate limited (429) — client is being throttled",
+                        timestamp=entry.started_date_time,
                         details={"status": status, "method": entry.request.method},
                         domain=domain,
                     )
@@ -935,10 +1079,8 @@ class HarAnalyzer:
 
         def sort_key(s: ServiceFailureStats) -> tuple[int, float, int]:
             error_count = s.network_error_count + s.status_5xx_count + s.status_4xx_count
-            problem_count = error_count + s.duration_exceeded_count
-            problem_rate = problem_count / s.request_count if s.request_count else 0.0
             is_down = 1 if s.success_count == 0 and error_count > 0 else 0
-            return (-is_down, -problem_rate, -s.request_count)
+            return (-is_down, -s.problem_rate, -s.request_count)
 
         return sorted(results, key=sort_key)
 
@@ -1067,10 +1209,483 @@ class HarAnalyzer:
             for domain, servers in sorted(by_domain.items())
         }
 
+    # -------------------------------------------------------------------------
+    # Compression Analysis
+    # -------------------------------------------------------------------------
+
+    COMPRESSION_MIN_BODY_BYTES = 1024  # 1KB
+
+    COMPRESSIBLE_CONTENT_TYPES = (
+        "text/",
+        "application/json",
+        "application/javascript",
+        "application/xml",
+        "application/xhtml+xml",
+        "application/ld+json",
+        "application/manifest+json",
+        "image/svg+xml",
+    )
+
+    def _analyze_compression(self, entries: list[HarEntry]) -> CompressionAnalysis | None:
+        """Analyze response compression usage."""
+        if not entries:
+            return None
+
+        encoding_counts: dict[str, int] = defaultdict(int)
+        compressible_uncompressed_count = 0
+        compressible_uncompressed_bytes = 0
+        total_analyzed = 0
+
+        for entry in entries:
+            body_size = entry.response.body_size
+            if body_size <= 0:
+                continue
+            total_analyzed += 1
+
+            # Check content-encoding
+            content_encoding = ""
+            content_type = ""
+            for header in entry.response.headers:
+                name_lower = header.name.lower()
+                if name_lower == "content-encoding":
+                    content_encoding = header.value.lower().strip()
+                elif name_lower == "content-type":
+                    content_type = header.value.lower().strip()
+
+            if content_encoding:
+                encoding_counts[content_encoding] += 1
+            else:
+                encoding_counts["none"] += 1
+
+                # Check if this is a compressible type that should be compressed
+                if body_size > self.COMPRESSION_MIN_BODY_BYTES and any(
+                    content_type.startswith(ct) for ct in self.COMPRESSIBLE_CONTENT_TYPES
+                ):
+                    compressible_uncompressed_count += 1
+                    compressible_uncompressed_bytes += body_size
+
+        if total_analyzed == 0:
+            return None
+
+        return CompressionAnalysis(
+            encoding_distribution=dict(
+                sorted(encoding_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+            ),
+            compressible_uncompressed_count=compressible_uncompressed_count,
+            compressible_uncompressed_bytes=compressible_uncompressed_bytes,
+            total_responses_analyzed=total_analyzed,
+        )
+
+    # -------------------------------------------------------------------------
+    # Cache Analysis
+    # -------------------------------------------------------------------------
+
+    HTTP_STATUS_OK = 200
+    HTTP_STATUS_NOT_MODIFIED = 304
+
+    def _analyze_caching(self, entries: list[HarEntry]) -> CacheAnalysis | None:
+        """Analyze caching behavior."""
+        if not entries:
+            return None
+
+        # Group by simplified URL
+        by_url: dict[str, list[HarEntry]] = defaultdict(list)
+        for entry in entries:
+            simplified = self._simplify_url(entry.request.url)
+            by_url[simplified].append(entry)
+
+        cache_hit_count = 0  # 304 responses
+        missing_cache_control_count = 0
+        repeated_downloads: list[dict[str, Any]] = []
+
+        for url, url_entries in by_url.items():
+            status_200_count = sum(
+                1 for e in url_entries if e.response.status == self.HTTP_STATUS_OK
+            )
+            status_304_count = sum(
+                1 for e in url_entries if e.response.status == self.HTTP_STATUS_NOT_MODIFIED
+            )
+            cache_hit_count += status_304_count
+
+            # Multiple 200s with no 304 = repeated download
+            if status_200_count > 1 and status_304_count == 0:
+                total_bytes = sum(
+                    e.response.body_size
+                    for e in url_entries
+                    if e.response.status == self.HTTP_STATUS_OK and e.response.body_size > 0
+                )
+                repeated_downloads.append(
+                    {
+                        "url": url,
+                        "count": status_200_count,
+                        "total_bytes": total_bytes,
+                    }
+                )
+
+            # Check for missing cache-control on static assets
+            for entry in url_entries:
+                if (
+                    _is_static_url(entry.request.url)
+                    and entry.response.status == self.HTTP_STATUS_OK
+                ):
+                    has_cache_control = any(
+                        h.name.lower() == "cache-control" for h in entry.response.headers
+                    )
+                    if not has_cache_control:
+                        missing_cache_control_count += 1
+                        break  # Count once per URL
+
+        repeated_downloads.sort(key=lambda x: -x["total_bytes"])
+        total_cacheable = cache_hit_count + sum(r["count"] for r in repeated_downloads)
+        cache_hit_ratio = cache_hit_count / total_cacheable if total_cacheable > 0 else 0.0
+
+        return CacheAnalysis(
+            total_cacheable_requests=total_cacheable,
+            cache_hit_count=cache_hit_count,
+            cache_miss_count=sum(r["count"] for r in repeated_downloads),
+            repeated_downloads=repeated_downloads[:20],
+            missing_cache_control_count=missing_cache_control_count,
+            cache_hit_ratio=cache_hit_ratio,
+        )
+
+    # -------------------------------------------------------------------------
+    # Error Burst Detection
+    # -------------------------------------------------------------------------
+
+    ERROR_BURST_WINDOW_MS = 5_000  # 5 seconds
+    ERROR_BURST_MIN_ERRORS = 3
+
+    def _detect_error_bursts(self, issues: list[DetectedIssue]) -> list[ErrorBurst]:
+        """Detect clusters of errors within short time windows."""
+        error_issues = [
+            i
+            for i in issues
+            if i.issue_type
+            in (
+                IssueType.NETWORK_ERROR,
+                IssueType.SERVER_ERROR,
+                IssueType.CLIENT_ERROR,
+                IssueType.RATE_LIMITED,
+            )
+        ]
+        if len(error_issues) < self.ERROR_BURST_MIN_ERRORS:
+            return []
+
+        sorted_errors = sorted(error_issues, key=lambda i: i.timestamp)
+        bursts: list[ErrorBurst] = []
+
+        i = 0
+        while i < len(sorted_errors):
+            window_start = sorted_errors[i].timestamp
+            window_end_limit = window_start + timedelta(milliseconds=self.ERROR_BURST_WINDOW_MS)
+            j = i
+            domains: set[str] = set()
+            while j < len(sorted_errors) and sorted_errors[j].timestamp <= window_end_limit:
+                domains.add(sorted_errors[j].domain)
+                j += 1
+
+            error_count = j - i
+            if error_count >= self.ERROR_BURST_MIN_ERRORS:
+                bursts.append(
+                    ErrorBurst(
+                        start_time=sorted_errors[i].timestamp,
+                        end_time=sorted_errors[j - 1].timestamp,
+                        error_count=error_count,
+                        affected_domains=sorted(domains),
+                    )
+                )
+                i = j  # Skip past this burst
+            else:
+                i += 1
+
+        return bursts
+
+    # -------------------------------------------------------------------------
+    # Request Rate
+    # -------------------------------------------------------------------------
+
+    def _compute_request_rate(
+        self, entries: list[HarEntry], capture_start: datetime | None, capture_end: datetime | None
+    ) -> RequestRateStats | None:
+        """Compute overall and peak request rates."""
+        if not entries or not capture_start or not capture_end:
+            return None
+
+        duration_seconds = (capture_end - capture_start).total_seconds()
+        if duration_seconds <= 0:
+            return None
+
+        overall_rps = len(entries) / duration_seconds
+
+        # Peak: 1-second sliding window
+        sorted_entries = sorted(entries, key=lambda e: e.started_date_time)
+        peak_rps = 0.0
+        for idx, entry in enumerate(sorted_entries):
+            window_end = entry.started_date_time + timedelta(seconds=1)
+            count = sum(1 for e in sorted_entries[idx:] if e.started_date_time <= window_end)
+            if count > peak_rps:
+                peak_rps = float(count)
+
+        return RequestRateStats(
+            overall_requests_per_second=overall_rps,
+            peak_requests_per_second=peak_rps,
+        )
+
+    # -------------------------------------------------------------------------
+    # Key Findings Generation
+    # -------------------------------------------------------------------------
+
+    DNS_P95_THRESHOLD_MS = 200.0
+    CONNECTION_REUSE_LOW_EFFICIENCY_PCT = 50.0
+    HTTP11_DOMINANCE_PCT = 50.0
+    BOTTLENECK_DOMINANCE_PCT = 50.0
+
+    def _generate_key_findings(self, report: HarAnalysisReport) -> list[KeyFinding]:
+        """Synthesize actionable key findings from the analysis report."""
+        findings: list[KeyFinding] = []
+
+        # 1. Outages: services with 100% error rate
+        outages = [
+            s
+            for s in report.service_failures
+            if s.success_count == 0
+            and (s.network_error_count + s.status_5xx_count + s.status_4xx_count) > 0
+            and not _is_static_path(s.path)
+        ]
+        if outages:
+            domains = sorted({s.domain for s in outages})
+            findings.append(
+                KeyFinding(
+                    category="outage",
+                    severity=IssueSeverity.CRITICAL,
+                    summary=(
+                        f"{len(outages)} endpoint(s) are completely down on {', '.join(domains)}"
+                    ),
+                    recommendation="Investigate backend health for these services immediately",
+                )
+            )
+
+        # 2. Dominant bottleneck phase
+        phase_totals = {
+            "DNS": report.dns_timings.total_duration_ms,
+            "Connect": report.connect_timings.total_duration_ms,
+            "SSL": report.ssl_timings.total_duration_ms,
+            "TTFB": report.ttfb_timings.total_duration_ms,
+            "Receive": report.receive_timings.total_duration_ms,
+        }
+        grand_total = sum(phase_totals.values())
+        if grand_total > 0:
+            dominant_phase = max(phase_totals, key=lambda k: phase_totals[k])
+            dominant_pct = phase_totals[dominant_phase] / grand_total * 100
+            if dominant_pct >= self.BOTTLENECK_DOMINANCE_PCT:
+                phase_recommendations = {
+                    "DNS": "Consider DNS prefetching or switching DNS providers",
+                    "Connect": "Check for connection pooling issues or high network latency",
+                    "SSL": "Investigate TLS handshake overhead; consider session resumption",
+                    "TTFB": "Investigate server-side processing; profile backend endpoints",
+                    "Receive": "Check for large responses; enable compression",
+                }
+                findings.append(
+                    KeyFinding(
+                        category="bottleneck",
+                        severity=IssueSeverity.HIGH,
+                        summary=(
+                            f"{dominant_phase} accounts for {dominant_pct:.0f}% of request time"
+                        ),
+                        recommendation=phase_recommendations[dominant_phase],
+                    )
+                )
+
+        # 3. DNS at p95
+        if report.dns_timings.count > 0 and report.dns_timings.p95 > self.DNS_P95_THRESHOLD_MS:
+            findings.append(
+                KeyFinding(
+                    category="dns",
+                    severity=IssueSeverity.MEDIUM,
+                    summary=(f"DNS resolution adding {report.dns_timings.p95:.0f}ms at p95"),
+                    recommendation="Consider DNS prefetching or preconnect hints",
+                )
+            )
+
+        # 4. HTTP/1.1 dominance
+        if report.http_version_distribution and report.total_requests > 0:
+            http11_count = sum(
+                count
+                for version, count in report.http_version_distribution.items()
+                if "1.1" in version
+            )
+            http11_pct = http11_count / report.total_requests * 100
+            if http11_pct > self.HTTP11_DOMINANCE_PCT:
+                findings.append(
+                    KeyFinding(
+                        category="protocol",
+                        severity=IssueSeverity.MEDIUM,
+                        summary=(f"{http11_pct:.0f}% of requests use HTTP/1.1"),
+                        recommendation=(
+                            "HTTP/2 would improve multiplexing and reduce connection overhead"
+                        ),
+                    )
+                )
+
+        # 5. Rate limiting
+        rate_limited_issues = [i for i in report.issues if i.issue_type == IssueType.RATE_LIMITED]
+        if rate_limited_issues:
+            affected_domains = sorted({i.domain for i in rate_limited_issues})
+            findings.append(
+                KeyFinding(
+                    category="rate_limiting",
+                    severity=IssueSeverity.HIGH,
+                    summary=(
+                        f"{len(rate_limited_issues)} request(s) throttled (429) "
+                        f"on {', '.join(affected_domains)}"
+                    ),
+                    recommendation="Reduce request frequency or implement backoff/retry logic",
+                )
+            )
+
+        # 6. Critical domains
+        critical_domains = [d for d in report.domains if d.health == DomainHealth.CRITICAL]
+        if critical_domains:
+            domain_names = [d.domain for d in critical_domains]
+            findings.append(
+                KeyFinding(
+                    category="domain_health",
+                    severity=IssueSeverity.CRITICAL,
+                    summary=(
+                        f"{len(critical_domains)} domain(s) in critical state: "
+                        f"{', '.join(domain_names)}"
+                    ),
+                    recommendation="Investigate error rates and backend health for these domains",
+                )
+            )
+
+        # 7. Poor connection reuse
+        if (
+            report.connection_reuse_stats
+            and report.connection_reuse_stats.efficiency_percent
+            < self.CONNECTION_REUSE_LOW_EFFICIENCY_PCT
+        ):
+            efficiency = report.connection_reuse_stats.efficiency_percent
+            findings.append(
+                KeyFinding(
+                    category="connection_reuse",
+                    severity=IssueSeverity.MEDIUM,
+                    summary=f"Connection reuse efficiency is {efficiency:.0f}%",
+                    recommendation=(
+                        "Check for premature connection closes or missing keep-alive headers"
+                    ),
+                )
+            )
+
+        # 8. Compression opportunities
+        if (
+            report.compression_analysis
+            and report.compression_analysis.compressible_uncompressed_count > 0
+        ):
+            comp = report.compression_analysis
+            size_mb = comp.compressible_uncompressed_bytes / ONE_MEGABYTE
+            findings.append(
+                KeyFinding(
+                    category="compression",
+                    severity=IssueSeverity.MEDIUM,
+                    summary=(
+                        f"{comp.compressible_uncompressed_count} response(s) "
+                        f"({size_mb:.1f} MB) could benefit from compression"
+                    ),
+                    recommendation="Enable gzip or Brotli compression on the server",
+                )
+            )
+
+        # 9. Repeated downloads (cache misses)
+        if report.cache_analysis and report.cache_analysis.repeated_downloads:
+            cache = report.cache_analysis
+            total_wasted = sum(r["total_bytes"] for r in cache.repeated_downloads)
+            wasted_mb = total_wasted / ONE_MEGABYTE
+            findings.append(
+                KeyFinding(
+                    category="caching",
+                    severity=IssueSeverity.MEDIUM,
+                    summary=(
+                        f"{len(cache.repeated_downloads)} resource(s) downloaded repeatedly "
+                        f"without caching, wasting {wasted_mb:.1f} MB"
+                    ),
+                    recommendation="Add appropriate Cache-Control headers to static resources",
+                )
+            )
+
+        # 10. Error bursts
+        if report.error_bursts:
+            total_burst_errors = sum(b.error_count for b in report.error_bursts)
+            all_domains = sorted({d for b in report.error_bursts for d in b.affected_domains})
+            findings.append(
+                KeyFinding(
+                    category="error_burst",
+                    severity=IssueSeverity.HIGH,
+                    summary=(
+                        f"{total_burst_errors} errors clustered in "
+                        f"{len(report.error_bursts)} burst(s) "
+                        f"affecting {', '.join(all_domains)}"
+                    ),
+                    recommendation="Investigate cascading failures or upstream outages",
+                )
+            )
+
+        # Sort by severity
+        severity_order = {sev: idx for idx, sev in enumerate(IssueSeverity)}
+        return sorted(findings, key=lambda f: severity_order[f.severity])
+
 
 # =============================================================================
 # Output Formatter
 # =============================================================================
+
+
+_STATIC_SUFFIXES = (
+    ".css",
+    ".js",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".otf",
+    ".eot",
+    ".map",
+)
+_STATIC_PREFIXES = ("/images/", "/styles/", "/static/", "/assets/", "/fonts/")
+
+
+def _is_static_path(path: str) -> bool:
+    """Heuristic for service paths to exclude static assets."""
+    path_lower = (path or "").lower()
+    if path_lower.endswith(_STATIC_SUFFIXES):
+        return True
+    return path_lower.startswith(_STATIC_PREFIXES)
+
+
+def _is_static_url(url: str) -> bool:
+    """Check if a URL points to a static asset."""
+    return _is_static_path(urlparse(url).path)
+
+
+_SECONDS_PER_MINUTE = 60
+
+
+def _format_duration(td: timedelta) -> str:
+    """Format a timedelta as human-readable duration (e.g. '2m 34s', '1h 5m 12s')."""
+    total_seconds = td.total_seconds()
+    if total_seconds < _SECONDS_PER_MINUTE:
+        return f"{total_seconds:.1f}s"
+    minutes, seconds = divmod(int(total_seconds), _SECONDS_PER_MINUTE)
+    hours, minutes = divmod(minutes, _SECONDS_PER_MINUTE)
+    if hours:
+        return f"{hours}h {minutes}m {seconds}s"
+    return f"{minutes}m {seconds}s"
+
 
 DOMAIN_ERROR_RATE_CRITICAL_PCT = 50.0
 DOMAIN_ERROR_RATE_DEGRADED_PCT = 10.0
@@ -1113,6 +1728,11 @@ class OutputFormatter:
 
     def print_report(self, report: HarAnalysisReport) -> None:
         """Print a backend/network-focused report to the terminal."""
+        # KEY FINDINGS (first thing shown)
+        if report.key_findings:
+            self._print_key_findings(report)
+            console.print()
+
         # SECTION 1: METADATA & INFRASTRUCTURE
         self._print_summary(report)
         console.print()
@@ -1166,11 +1786,53 @@ class OutputFormatter:
 
         self._print_top_endpoints(report)
 
+        # SECTION 3: ADVANCED ANALYSIS
+        if report.compression_analysis:
+            console.print()
+            self._print_compression_analysis(report)
+
+        if report.cache_analysis:
+            console.print()
+            self._print_cache_analysis(report)
+
+        if report.error_bursts:
+            console.print()
+            self._print_error_bursts(report)
+
+    def _print_key_findings(self, report: HarAnalysisReport) -> None:
+        """Print key findings panel."""
+        severity_colors = {
+            IssueSeverity.CRITICAL: "red",
+            IssueSeverity.HIGH: "orange1",
+            IssueSeverity.MEDIUM: "yellow",
+            IssueSeverity.LOW: "blue",
+        }
+        severity_labels = {
+            IssueSeverity.CRITICAL: "CRITICAL",
+            IssueSeverity.HIGH: "HIGH",
+            IssueSeverity.MEDIUM: "MEDIUM",
+            IssueSeverity.LOW: "LOW",
+        }
+        lines: list[str] = []
+        for finding in report.key_findings:
+            color = severity_colors[finding.severity]
+            label = severity_labels[finding.severity]
+            lines.append(f"[{color}][bold][{label}][/bold] {finding.summary}[/{color}]")
+            lines.append(f"  [dim]{finding.recommendation}[/dim]")
+        console.print(
+            Panel(
+                "\n".join(lines),
+                title="[bold yellow]Key Findings[/bold yellow]",
+                border_style="yellow",
+            )
+        )
+
     def generate_markdown_report(self, report: HarAnalysisReport, har_filename: str) -> str:
         """Generate a factual markdown report."""
         lines: list[str] = []
         # SECTION 1: METADATA & INFRASTRUCTURE
         lines.extend(self._md_header(har_filename))
+        lines.extend(self._md_key_findings(report))
         lines.extend(self._md_hostnames(report))
         lines.extend(self._md_summary(report))
         lines.extend(self._md_infrastructure_details(report))
@@ -1191,6 +1853,10 @@ class OutputFormatter:
             )
         )
         lines.extend(self._md_top_endpoints(report))
+        # SECTION 3: ADVANCED ANALYSIS
+        lines.extend(self._md_compression_analysis(report))
+        lines.extend(self._md_cache_analysis(report))
+        lines.extend(self._md_error_bursts(report))
         return "\n".join(lines)
 
     def _md_header(self, har_filename: str) -> list[str]:
@@ -1203,6 +1869,16 @@ class OutputFormatter:
         lines.extend(["", "---", ""])
         return lines
 
+    def _md_key_findings(self, report: HarAnalysisReport) -> list[str]:
+        if not report.key_findings:
+            return []
+        lines = ["## Key Findings", ""]
+        for finding in report.key_findings:
+            severity_label = finding.severity.value.upper()
+            lines.append(f"- **[{severity_label}]** {finding.summary} — *{finding.recommendation}*")
+        lines.append("")
+        return lines
+
     def _md_hostnames(self, report: HarAnalysisReport) -> list[str]:
         hostnames = self._extract_hostnames(report)
         lines = ["## Hostnames", ""]
@@ -1212,15 +1888,19 @@ class OutputFormatter:
 
     def _md_summary(self, report: HarAnalysisReport) -> list[str]:
         total_status = sum(report.status_codes.values()) or 1
-        capture_start, capture_end = capture_window(report)
 
         lines = ["## Summary", ""]
         lines.append(f"- **Total Requests:** {report.total_requests:,}")
         lines.append(f"- **Total Duration:** {report.total_duration_ms / 1000:.1f}s")
-        if capture_start and capture_end:
+        if report.capture_start and report.capture_end:
             lines.append(
                 "- **Capture Window:** "
-                f"{self._format_timestamp(capture_start)} → {self._format_timestamp(capture_end)}"
+                f"{self._format_timestamp(report.capture_start)} → "
+                f"{self._format_timestamp(report.capture_end)}"
+            )
+            lines.append(
+                f"- **Capture Duration:** "
+                f"{_format_duration(report.capture_end - report.capture_start)}"
             )
         lines.append(
             "- **Total Transferred (best-effort):** "
@@ -1275,6 +1955,22 @@ class OutputFormatter:
             ]
         )
         lines.append("")
+        if report.request_rate_stats:
+            rr = report.request_rate_stats
+            lines.append(
+                f"- **Request Rate:** {rr.overall_requests_per_second:.1f} req/s "
+                f"(peak: {rr.peak_requests_per_second:.0f} req/s)"
+            )
+            lines.append("")
+        if report.phase_breakdown:
+            lines.append("### Phase Breakdown")
+            lines.append("")
+            lines.extend(
+                f"- **{phase.phase_name}:** {phase.percentage_of_total:.0f}%"
+                for phase in report.phase_breakdown
+                if phase.percentage_of_total >= 1.0
+            )
+            lines.append("")
         if report.referer_hostnames:
             lines.extend(self._md_referer_hostnames(report))
         return lines
@@ -1297,14 +1993,15 @@ class OutputFormatter:
         lines = [
             "## Domain Health Overview",
             "",
-            "| Domain | Requests | Errors | Error Rate | p95 | Status |",
-            "|--------|----------|--------|------------|-----|--------|",
+            "| Domain | Requests | Errors | Error Rate | p95 | Bottleneck | Status |",
+            "|--------|----------|--------|------------|-----|------------|--------|",
         ]
         lines.extend(
             [
                 (
                     f"| `{domain.domain}` | {domain.total_requests} | {domain.failed_requests} | "
                     f"{domain.error_rate:.1f}% | {domain.timing_stats.p95:.0f}ms | "
+                    f"**{domain.dominant_bottleneck or '-'}** | "
                     f"**{status_text[domain.health]}** |"
                 )
                 for domain in report.domains
@@ -1441,17 +2138,22 @@ class OutputFormatter:
         hostnames = self._extract_hostnames(report)
         hostname_lines = ["**Hostnames:**", *[f"- {h}" for h in hostnames], ""]
         total_transferred_mb = report.total_bytes_transferred / 1024 / 1024
-        capture_start, capture_end = capture_window(report)
 
         summary_lines: list[str] = [*hostname_lines]
         summary_lines.append(f"**Total Requests:** {report.total_requests:,}")
         summary_lines.append("")
         summary_lines.append(f"**Total Duration:** {report.total_duration_ms / 1000:.1f}s")
         summary_lines.append("")
-        if capture_start and capture_end:
+        if report.capture_start and report.capture_end:
             summary_lines.append(
                 "**Capture Window:** "
-                f"{self._format_timestamp(capture_start)} → {self._format_timestamp(capture_end)}"
+                f"{self._format_timestamp(report.capture_start)} → "
+                f"{self._format_timestamp(report.capture_end)}"
+            )
+            summary_lines.append("")
+            summary_lines.append(
+                f"**Capture Duration:** "
+                f"{_format_duration(report.capture_end - report.capture_start)}"
             )
             summary_lines.append("")
         if self._timestamp_timezone_label:
@@ -1475,6 +2177,23 @@ class OutputFormatter:
                 self._format_status_codes(report.status_codes),
             ]
         )
+
+        if report.request_rate_stats:
+            summary_lines.append("")
+            rr = report.request_rate_stats
+            summary_lines.append(
+                f"**Request Rate:** {rr.overall_requests_per_second:.1f} req/s "
+                f"(peak: {rr.peak_requests_per_second:.0f} req/s)"
+            )
+
+        if report.phase_breakdown:
+            summary_lines.append("")
+            summary_lines.append("**Phase Breakdown:**")
+            summary_lines.extend(
+                f"- {phase.phase_name}: {phase.percentage_of_total:.0f}%"
+                for phase in report.phase_breakdown
+                if phase.percentage_of_total >= 1.0
+            )
 
         console.print(
             Panel(
@@ -1510,6 +2229,7 @@ class OutputFormatter:
         table.add_column("Errors", justify="right")
         table.add_column("Error Rate", justify="right")
         table.add_column("p95 total", justify="right")
+        table.add_column("Bottleneck", justify="center")
         table.add_column("Status", justify="center")
 
         health_styles = {
@@ -1535,6 +2255,7 @@ class OutputFormatter:
                 if error_rate_style
                 else f"{domain.error_rate:.1f}%",
                 f"{domain.timing_stats.p95:.0f}ms",
+                domain.dominant_bottleneck or "-",
                 f"[{style}]{status_text}[/{style}]",
             )
 
@@ -1615,13 +2336,6 @@ class OutputFormatter:
         table.add_column("p95 net", justify="right")
 
         for s in failing[:max_rows]:
-            problem_count = (
-                s.network_error_count
-                + s.status_5xx_count
-                + s.status_4xx_count
-                + s.duration_exceeded_count
-            )
-            problem_rate = 100.0 * problem_count / s.request_count if s.request_count else 0.0
             p95_net = s.network_total_timings.p95 if s.network_total_timings.count else None
             table.add_row(
                 s.domain,
@@ -1633,7 +2347,7 @@ class OutputFormatter:
                 str(s.status_5xx_count) if s.status_5xx_count else "-",
                 str(s.status_4xx_count) if s.status_4xx_count else "-",
                 str(s.duration_exceeded_count) if s.duration_exceeded_count else "-",
-                f"{problem_rate:.1f}%",
+                f"{s.problem_rate * 100:.1f}%",
                 f"{s.timings.p95:.0f}ms",
                 f"{s.ttfb_timings.p95:.0f}ms",
                 f"{p95_net:.0f}ms" if p95_net is not None else "-",
@@ -1748,19 +2462,12 @@ class OutputFormatter:
         console.print(table)
 
     def _md_service_row(self, s: ServiceFailureStats) -> str:
-        problem_count = (
-            s.network_error_count
-            + s.status_5xx_count
-            + s.status_4xx_count
-            + s.duration_exceeded_count
-        )
-        problem_rate = 100.0 * problem_count / s.request_count if s.request_count else 0.0
         p95_net = s.network_total_timings.p95 if s.network_total_timings.count else None
         p95_net_str = f"{p95_net:.0f}ms" if p95_net is not None else "-"
         return (
             f"| `{s.domain}` | `{s.method}` | `{s.path}` | {s.request_count} | "
             f"{s.success_count} | {s.network_error_count} | {s.status_5xx_count} | "
-            f"{s.status_4xx_count} | {s.duration_exceeded_count} | {problem_rate:.1f}% | "
+            f"{s.status_4xx_count} | {s.duration_exceeded_count} | {s.problem_rate * 100:.1f}% | "
             f"{s.timings.p95:.0f}ms | {s.ttfb_timings.p95:.0f}ms | {p95_net_str} |"
         )
 
@@ -1769,6 +2476,7 @@ class OutputFormatter:
             IssueType.NETWORK_ERROR,
             IssueType.SERVER_ERROR,
             IssueType.CLIENT_ERROR,
+            IssueType.RATE_LIMITED,
         }
         return [
             i for i in issues if i.issue_type in error_types and not self._is_static_asset(i.url)
@@ -1780,53 +2488,113 @@ class OutputFormatter:
             i for i in issues if i.issue_type in perf_types and not self._is_static_asset(i.url)
         ]
 
-    def _is_static_asset(self, url: str) -> bool:
-        parsed = urlparse(url)
-        path = (parsed.path or "").lower()
-        static_suffixes = (
-            ".css",
-            ".js",
-            ".png",
-            ".jpg",
-            ".jpeg",
-            ".gif",
-            ".svg",
-            ".ico",
-            ".woff",
-            ".woff2",
-            ".ttf",
-            ".otf",
-            ".eot",
-            ".map",
-        )
-        if path.endswith(static_suffixes):
-            return True
-        static_prefixes = ("/images/", "/styles/", "/static/", "/assets/", "/fonts/")
-        return path.startswith(static_prefixes)
+    @staticmethod
+    def _is_static_asset(url: str) -> bool:
+        """Check if a URL points to a static asset."""
+        return _is_static_url(url)
 
-    def _is_static_path(self, path: str) -> bool:
+    @staticmethod
+    def _is_static_path(path: str) -> bool:
         """Heuristic for service paths to exclude static assets."""
-        path_lower = (path or "").lower()
-        static_suffixes = (
-            ".css",
-            ".js",
-            ".png",
-            ".jpg",
-            ".jpeg",
-            ".gif",
-            ".svg",
-            ".ico",
-            ".woff",
-            ".woff2",
-            ".ttf",
-            ".otf",
-            ".eot",
-            ".map",
+        return _is_static_path(path)
+
+    # -------------------------------------------------------------------------
+    # Compression Analysis (Terminal)
+    # -------------------------------------------------------------------------
+
+    def _print_compression_analysis(self, report: HarAnalysisReport) -> None:
+        """Print compression analysis panel."""
+        comp = report.compression_analysis
+        if not comp:
+            return
+
+        lines: list[str] = ["**Encoding Distribution:**"]
+        for encoding, count in comp.encoding_distribution.items():
+            pct = (
+                count / comp.total_responses_analyzed * 100 if comp.total_responses_analyzed else 0
+            )
+            lines.append(f"- {encoding}: {count:,} ({pct:.1f}%)")
+        lines.append("")
+
+        if comp.compressible_uncompressed_count > 0:
+            size_mb = comp.compressible_uncompressed_bytes / ONE_MEGABYTE
+            lines.append(
+                f"**Compression Opportunities:** {comp.compressible_uncompressed_count} "
+                f"compressible response(s) sent without compression ({size_mb:.1f} MB)"
+            )
+        else:
+            lines.append("**Compression Opportunities:** None detected")
+
+        console.print(
+            Panel(
+                Markdown("\n".join(lines)),
+                title="[bold magenta]Compression Analysis[/bold magenta]",
+                border_style="magenta",
+            )
         )
-        if path_lower.endswith(static_suffixes):
-            return True
-        static_prefixes = ("/images/", "/styles/", "/static/", "/assets/", "/fonts/")
-        return path_lower.startswith(static_prefixes)
+
+    # -------------------------------------------------------------------------
+    # Cache Analysis (Terminal)
+    # -------------------------------------------------------------------------
+
+    def _print_cache_analysis(self, report: HarAnalysisReport) -> None:
+        """Print cache analysis panel."""
+        cache = report.cache_analysis
+        if not cache:
+            return
+
+        lines: list[str] = [
+            f"**Cache Hit Ratio:** {cache.cache_hit_ratio * 100:.1f}%",
+            f"**304 (Cache Hit) Responses:** {cache.cache_hit_count:,}",
+            f"**Repeated Downloads:** {cache.cache_miss_count:,} requests across "
+            f"{len(cache.repeated_downloads)} URL(s)",
+        ]
+        if cache.missing_cache_control_count > 0:
+            lines.append(
+                f"**Missing Cache-Control:** {cache.missing_cache_control_count} "
+                f"static asset URL(s) without Cache-Control header"
+            )
+        lines.append("")
+
+        if cache.repeated_downloads:
+            lines.append("**Top Repeated Downloads:**")
+            for item in cache.repeated_downloads[:10]:
+                path = self._extract_path(str(item["url"]))
+                total_kb = int(item["total_bytes"]) / 1024
+                lines.append(f"- `{path}` x{item['count']} ({total_kb:.0f} KB)")
+
+        console.print(
+            Panel(
+                Markdown("\n".join(lines)),
+                title="[bold blue]Cache Analysis[/bold blue]",
+                border_style="blue",
+            )
+        )
+
+    # -------------------------------------------------------------------------
+    # Error Bursts (Terminal)
+    # -------------------------------------------------------------------------
+
+    def _print_error_bursts(self, report: HarAnalysisReport) -> None:
+        """Print error burst detection results."""
+        if not report.error_bursts:
+            return
+
+        table = Table(title="Error Bursts (3+ errors within 5s)")
+        table.add_column("Start", style="dim")
+        table.add_column("End", style="dim")
+        table.add_column("Errors", justify="right", style="red")
+        table.add_column("Affected Domains", style="cyan", no_wrap=False)
+
+        for burst in report.error_bursts[:10]:
+            table.add_row(
+                self._format_timestamp(burst.start_time, timespec="seconds"),
+                self._format_timestamp(burst.end_time, timespec="seconds"),
+                str(burst.error_count),
+                ", ".join(burst.affected_domains),
+            )
+
+        console.print(table)
 
     # -------------------------------------------------------------------------
     # Infrastructure Details (Terminal)
@@ -2042,6 +2810,88 @@ class OutputFormatter:
             truncated_path = path[:PATH_TRUNCATE_TINY] if len(path) > PATH_TRUNCATE_TINY else path
             content_type = body.content_type[:25] if body.content_type else "-"
             lines.append(f"| {size_str} | `{body.method}` | `{truncated_path}` | {content_type} |")
+        lines.append("")
+        return lines
+
+    # -------------------------------------------------------------------------
+    # Advanced Analysis (Markdown)
+    # -------------------------------------------------------------------------
+
+    def _md_compression_analysis(self, report: HarAnalysisReport) -> list[str]:
+        """Generate markdown for compression analysis."""
+        comp = report.compression_analysis
+        if not comp:
+            return []
+
+        lines: list[str] = ["## Compression Analysis", ""]
+        lines.append("### Encoding Distribution")
+        lines.append("")
+        for encoding, count in comp.encoding_distribution.items():
+            pct = (
+                count / comp.total_responses_analyzed * 100 if comp.total_responses_analyzed else 0
+            )
+            lines.append(f"- **{encoding}:** {count:,} ({pct:.1f}%)")
+        lines.append("")
+
+        if comp.compressible_uncompressed_count > 0:
+            size_mb = comp.compressible_uncompressed_bytes / ONE_MEGABYTE
+            lines.append(
+                f"**Compression Opportunities:** {comp.compressible_uncompressed_count} "
+                f"compressible response(s) sent without compression ({size_mb:.1f} MB)"
+            )
+            lines.append("")
+
+        return lines
+
+    def _md_cache_analysis(self, report: HarAnalysisReport) -> list[str]:
+        """Generate markdown for cache analysis."""
+        cache = report.cache_analysis
+        if not cache:
+            return []
+
+        lines: list[str] = ["## Cache Analysis", ""]
+        lines.append(f"- **Cache Hit Ratio:** {cache.cache_hit_ratio * 100:.1f}%")
+        lines.append(f"- **304 (Cache Hit) Responses:** {cache.cache_hit_count:,}")
+        lines.append(
+            f"- **Repeated Downloads:** {cache.cache_miss_count:,} requests across "
+            f"{len(cache.repeated_downloads)} URL(s)"
+        )
+        if cache.missing_cache_control_count > 0:
+            lines.append(
+                f"- **Missing Cache-Control:** {cache.missing_cache_control_count} "
+                f"static asset URL(s)"
+            )
+        lines.append("")
+
+        if cache.repeated_downloads:
+            lines.append("### Repeated Downloads")
+            lines.append("")
+            lines.append("| URL | Downloads | Total Size |")
+            lines.append("|-----|-----------|------------|")
+            for item in cache.repeated_downloads[:20]:
+                path = self._extract_path(str(item["url"]))
+                truncated = (
+                    path[:PATH_TRUNCATE_MEDIUM] if len(path) > PATH_TRUNCATE_MEDIUM else path
+                )
+                total_kb = int(item["total_bytes"]) / 1024
+                lines.append(f"| `{truncated}` | {item['count']} | {total_kb:.0f} KB |")
+            lines.append("")
+
+        return lines
+
+    def _md_error_bursts(self, report: HarAnalysisReport) -> list[str]:
+        """Generate markdown for error burst detection."""
+        if not report.error_bursts:
+            return []
+
+        lines: list[str] = ["## Error Bursts", ""]
+        lines.append("| Start | End | Errors | Affected Domains |")
+        lines.append("|-------|-----|--------|------------------|")
+        for burst in report.error_bursts[:10]:
+            start = self._format_timestamp(burst.start_time, timespec="seconds")
+            end = self._format_timestamp(burst.end_time, timespec="seconds")
+            domains = ", ".join(burst.affected_domains)
+            lines.append(f"| `{start}` | `{end}` | {burst.error_count} | {domains} |")
         lines.append("")
         return lines
 

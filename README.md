@@ -10,12 +10,17 @@ HAR Analyze is a Python package that parses HAR 1.2 files captured from browser 
 
 - **Performance Metrics**: Timing percentiles (p50, p95, p99) for overall requests and broken down by phase (DNS, connect, SSL, TTFB, receive)
 - **Infrastructure Details**: HTTP version distribution, server software identification, server IP addresses by domain, connection reuse efficiency
-- **Issue Detection**: Automatic identification of network errors, HTTP 4xx/5xx responses, slow endpoints, large payloads, redirect chains, and connection blocking
-- **Domain Health Analysis**: Per-domain breakdown with error rates and health status (healthy, degraded, critical)
+- **Key Findings**: Synthesized executive summary of actionable insights (outages, bottlenecks, protocol issues, rate limiting)
+- **Issue Detection**: Automatic identification of network errors, HTTP 4xx/5xx responses, rate limiting (429), slow endpoints, large payloads, redirect chains, and connection blocking
+- **Domain Health Analysis**: Per-domain breakdown with error rates, bottleneck classification, and health status (healthy, degraded, critical)
 - **Service Failure Tracking**: Backend/API service health grouped by domain, method, and path
+- **Bottleneck Attribution**: Phase breakdown (DNS, connect, SSL, TTFB, receive) showing where time is spent
 - **Time Gap Analysis**: Detection of significant gaps (>1 second) between consecutive requests indicating client-side processing delays
 - **Large Request Bodies**: Identification of large POST/PUT payloads (>100KB) that may cause upload slowness
-- **Cache Analysis**: Cache hit/miss ratios and detection of repeatedly downloaded resources
+- **Compression Analysis**: Detection of uncompressed compressible responses and encoding distribution
+- **Cache Analysis**: Cache hit/miss ratios, detection of repeatedly downloaded resources, and missing Cache-Control headers
+- **Error Burst Detection**: Identification of error clusters within short time windows
+- **Request Rate**: Overall and peak request rates
 
 ### Detected Issue Types
 
@@ -26,6 +31,7 @@ HAR Analyze automatically detects and categorizes the following issues:
 | Network Error | Critical | Connection failures (status=0 or explicit error) |
 | Duration Exceeded | Critical | Requests exceeding 30-second threshold |
 | Server Error | High | HTTP 5xx responses |
+| Rate Limited | High | HTTP 429 responses (client is being throttled) |
 | Client Error | Medium/High | HTTP 4xx responses (401/403 are High severity) |
 | Slow Endpoint | High | Endpoints with p95 latency > 10 seconds |
 | Large Payload | Medium | Responses exceeding 1 MB |

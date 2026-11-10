@@ -45,7 +45,7 @@ HAR Analyze is a Python package that parses HAR 1.2 files captured from browser 
 
 ## Toolchain
 
-- **Python**: 3.11-3.13
+- **Python**: 3.11-3.15
 - **Formatter/Linter**: `ruff format` and `ruff check --fix`
 - **Type checker**: `basedpyright` (strict)
 - **Tests**: `pytest` with branch coverage >= 90%; optional `hypothesis`
@@ -69,7 +69,7 @@ pip-audit  # or osv-scanner; fail on critical vulnerabilities
 
 Environment: `TZ=UTC`, `PYTHONUTF8=1`, `LC_ALL=C.UTF-8`, `PYTHONWARNINGS=error`
 
-Matrix across Python 3.11-3.13. Cache `uv` environments. Commit `uv.lock`.
+Matrix across Python 3.11-3.15. Cache `uv` environments. Commit `uv.lock`.
 
 ---
 

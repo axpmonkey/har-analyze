@@ -1,148 +1,268 @@
 # HAR Analyze
 
-A command-line tool that reads a browser HAR capture and reports what went wrong between the
-browser and a Java application server stack (load balancer, web server, Tomcat): which
-requests failed, which tier answered, and which server logs to open, with the times to
-search for.
+HAR Analyze turns an HTTP Archive (HAR) capture into a report of failed requests,
+slow endpoints, and network timing. Use it to investigate a browser session and
+identify the requests and time windows to check in server logs.
 
-## Requirements
+The application reads local HAR files and produces terminal, Markdown, JSON, or
+JSON Lines output. Analysis runs locally without contacting the captured servers.
+Additional diagnostics help investigate proxy, Apache HTTP Server, Tomcat, and
+Java application failures when the capture contains the necessary evidence.
 
-- Python 3.15
-- [uv](https://docs.astral.sh/uv/)
+## Install and verify
 
-## Install
+You need [Git](https://git-scm.com/downloads), [uv](https://docs.astral.sh/uv/getting-started/installation/),
+and Python **3.15**. Other Python versions are outside the package's supported range.
+
+If uv is not installed, use the command for your operating system from its
+[installation guide](https://docs.astral.sh/uv/getting-started/installation/):
+
+**macOS or Linux**
 
 ```bash
-# Install uv (macOS / Linux)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
+**Windows PowerShell**
+
 ```powershell
-# Install uv (Windows PowerShell)
 irm https://astral.sh/uv/install.ps1 | iex
 ```
 
+Open a new terminal after installation, then download and install HAR Analyze:
+
 ```bash
-git clone git@github.com:axpmonkey/har-analyze.git
+git clone https://github.com/axpmonkey/har-analyze.git
 cd har-analyze
 uv sync --python 3.15
+uv run har-analyze version
 ```
 
-## Capture a HAR file
+uv creates a `.venv` environment and installs the application and its dependencies.
+It can [download Python when needed](https://docs.astral.sh/uv/concepts/python-versions/#installing-a-python-version).
+Installation requires internet access; analysis of a local file does not.
+You do not need to activate the environment when using `uv run`.
 
-1. Open the browser's developer tools and select the **Network** tab.
-2. Turn on **Preserve log** before reproducing the problem.
-3. Reproduce the problem.
-4. Export the capture as a HAR file.
+Run all commands below from the `har-analyze` directory.
 
-In Chrome, the default export removes cookies. Choose **Export HAR (with sensitive data)**
-if you need the report to show backend nodes and session changes. That file contains session
-IDs, so treat it as a secret.
+## Capture a browser session
 
-## Run
+1. Open your browser's developer tools and select the **Network** panel.
+2. Enable **Preserve log** to retain requests across page navigation.
+3. Clear existing requests, then reproduce the problem.
+4. Export the network log as a HAR file, for example `capture.har`.
+
+Keep the capture focused on the problem, including the steps immediately before
+and after it. Preserve response content if you need error-page analysis.
+
+HAR files can contain credentials, cookies, tokens, and request or response data.
+Use a sanitized export for routine analysis. If you need session or backend routing
+diagnostics, the export must retain cookie headers; a sanitized file may omit them.
+Protect captures containing sensitive data and review reports before sharing them.
+
+## Analyze a capture
+
+Display a report in the terminal:
 
 ```bash
-# Report in the terminal
 uv run har-analyze analyze capture.har
-
-# Report as a Markdown file
-uv run har-analyze analyze capture.har -o report.md
-
-# Short summary (about 5 KB of Markdown)
-uv run har-analyze analyze capture.har --brief
-
-# Show times in the servers' timezone, to match their logs
-uv run har-analyze analyze capture.har --timezone America/New_York
 ```
 
-Run `uv run har-analyze analyze --help` for every option, and `uv run har-analyze version`
-for the installed version.
-
-## Read the report
-
-Start at the top and stop when you have what you need.
-
-| Section | What it tells you |
-|---------|-------------------|
-| **Key Findings** | The few things that matter most, worst first. |
-| **Incidents** | Every failed request, grouped by endpoint and status. Each incident lists its evidence, the time window to search for in server logs, and which logs to open first. |
-| **Timeout Clusters** | Failed requests that all took the same time, which points at a timeout setting. |
-| **5xx Error Origin** | Which tier wrote the error, read from the error page when the capture kept it. |
-| **Host-wide Stalls** | Requests sent at different times that were all answered together, with the window to check in GC logs and thread dumps. |
-| **Session Events** | Requests sent back to the login page, session routes that changed, sessions issued again. |
-| **Timeline** | Requests, errors and wait time per time bucket. |
-| **Log Correlation** | When each failed or slow request was sent, to find it in an access log. |
-| **Backend/API Service Health** | Counts and wait times per endpoint. |
-| **Slowest Requests / Endpoints** | Where the time went, by phase. |
-
-Keep these in mind when reading the numbers:
-
-- **All times are the browser's clock.** A server's clock may differ; the report shows the
-  difference when it can measure one.
-- **Wait (TTFB) is not server time alone.** It is the network round trip, every proxy and
-  the application together.
-- **Findings say "consistent with", not "caused by".** A capture shows what the browser saw.
-  Confirm the cause in the server logs the report points to.
-- **"Not available" means the capture did not contain the evidence**, for example cookies in
-  a sanitized export.
-- **Query string values are hidden** unless you pass `--show-query`. Session IDs are never
-  printed.
-
-## Options
-
-### Output
-
-| Option | Description |
-|--------|-------------|
-| `-o`, `--output PATH` | Write the report as Markdown. |
-| `--brief` | Write a compact Markdown summary. |
-| `--json PATH` | Write the full report as JSON, with the same redaction as the other outputs. |
-| `--export-events PATH` | Write one JSON line per request, for merging with server logs. |
-| `-t`, `--timezone ZONE` | Show times in a timezone, for example `UTC`, `local` or `America/New_York`. |
-| `--local-time` | Show times in your local timezone. |
-| `--show-query` | Show query strings and fragments unredacted. |
-| `-v`, `--verbose` | Verbose logging. |
-
-### Rules
-
-| Option | Description |
-|--------|-------------|
-| `--expect STATUS:PATH_GLOB` | Treat a response as normal for the application, for example `401:/SASLogon/*`. Repeatable. |
-| `--no-default-expect` | Drop the built-in rules (`401:/SASLogon/*`, `3xx:/SASLogon/*`, `404:*/favicon.ico`). |
-| `--path-rule REGEX=NAME` | Group path segments that match `REGEX` under `{NAME}`. Repeatable. IDs that are numbers, UUIDs or long hex strings are grouped automatically. |
-| `--config-facts PATH` | A `config_facts.json` from `sas-casefile config`. The report then names timeout settings whose length matches a timeout cluster, and compares idle time with the session timeout. |
-
-### Thresholds
-
-| Option | Default | Flags |
-|--------|---------|-------|
-| `--slow-ms` | 10000 | Endpoints whose wait for the first byte is longer. |
-| `--duration-exceeded-ms` | 30000 | Individual requests that took longer. |
-| `--blocking-ms` | 5000 | Requests queued in the browser for longer. |
-| `--gap-ms` | 1000 | Periods longer than this with no request in flight. |
-| `--large-payload-bytes` | 1048576 | Responses larger than this. |
-| `--large-request-body-bytes` | 102400 | Request bodies larger than this. |
-| `--redirect-chain-min-hops` | 3 | Redirect chains at least this long. |
-| `--timeout-cluster-min` | 3 | Minimum failed requests that form a timeout cluster. |
-| `--timeout-tolerance-pct` | 2 | How close the durations in a cluster must be (±%). |
-
-## Limitations
-
-- The tool has been tested on synthetic captures only. It has not yet been checked against
-  real Chrome, Firefox or Edge exports, so read the first few reports against the capture in
-  the browser's developer tools.
-- A capture is one browser's view. It cannot show garbage collection, thread pools or
-  database contention directly; the report tells you when and where to look for them.
-
-## Development
+Replace `capture.har` with the path to your file. Quote paths containing spaces:
 
 ```bash
-uv sync --upgrade --extra dev --python 3.15
-uv run --no-sync ruff format --check
-uv run --no-sync ruff check
-uv run --no-sync basedpyright
-TZ=UTC uv run --no-sync pytest -q --cov=src/har_analyze --cov-branch --cov-fail-under=90
-uv run --no-sync pip-audit
+uv run har-analyze analyze "captures/login failure.har"
 ```
 
-Contributor rules are in `AGENTS.md`.
+### Save a report
+
+Write a Markdown report that you can open in a Markdown viewer or attach to a
+support case:
+
+```bash
+uv run har-analyze analyze capture.har -o report.md
+```
+
+For a compact Markdown summary of up to approximately 5 KB, use `--brief`:
+
+```bash
+uv run har-analyze analyze capture.har --brief -o summary.md
+```
+
+Create the destination directory before exporting. An existing output file is
+replaced.
+
+### Match the timezone used in server logs
+
+```bash
+uv run har-analyze analyze capture.har --timezone America/New_York -o report.md
+```
+
+Use `--timezone UTC` for UTC or `--local-time` for your computer's timezone.
+Without either option, displayed capture timestamps retain their recorded offsets.
+Do not combine `--timezone` with `--local-time`.
+
+Timezone conversion changes how timestamps are displayed. It does not correct
+differences between browser and server clocks. HTTP Date header differences, when
+reported, are uncertain evidence rather than clock corrections.
+
+### Export structured data
+
+Write the full report as JSON for further processing:
+
+```bash
+uv run har-analyze analyze capture.har --json report.json -o report.md
+```
+
+The JSON document contains report metadata, including `schema_version` and
+`tool_version`, followed by the analysis in `report`. It includes data beyond the
+row limits used in the readable reports.
+
+Export one event per accepted request as JSON Lines for correlation with other logs:
+
+```bash
+uv run har-analyze analyze capture.har --export-events capture.events.jsonl
+```
+
+Events are sorted by request start time. Each includes a UTC timestamp (`ts`),
+host, severity (`level`), request summary (`message`), duration, and request details
+in `attrs`. Paths are grouped into templates and query strings are omitted.
+`attrs.sent_ts` estimates when the browser finished sending the request.
+Display timezone options do not change event timestamps.
+
+`--json` and `--export-events` add exports; the usual terminal or Markdown report
+is still produced.
+
+## Understand the report
+
+Start with **Key Findings**, then use **Incidents** to find the failed requests,
+supporting evidence, and suggested server logs. Sections appear when applicable;
+their contents depend on what the HAR file recorded.
+
+| Section | How to use it |
+| --- | --- |
+| Key Findings | Review the highest-priority observations and investigation steps. |
+| Incidents | Find failures grouped by endpoint and signature, with log-search time windows. |
+| Summary and Timing Percentiles | Check capture size, duration, response counts, and timing distributions. |
+| Domain Health Overview and Backend/API Service Health | Locate hosts and endpoints with failures or high latency. These describe the captured session. |
+| Timeout Clusters | Find failed requests with similar waits or durations; compare them with configured timeout values. A cluster alone does not prove a timeout. |
+| 5xx Error Origin | Review error-page and header evidence about which tier produced an error. |
+| Host-wide Stalls and Session Events | Investigate responses arriving together, login redirects, session re-issues, or backend route changes. |
+| Timeline and Log Correlation | Locate periods of failure and request timestamps to search in server logs. |
+| Slowest Individual Requests and Slowest Endpoints | Compare total duration with browser queueing, network phases, and wait time. |
+| Infrastructure and Cache Analysis | Review recorded protocols, connections, server details, and cache behavior. |
+
+### Timing and status definitions
+
+| Term | Meaning |
+| --- | --- |
+| Total Duration | Sum of individual request durations. Concurrent requests overlap, so this can exceed the elapsed capture duration. |
+| Capture Duration | Elapsed time from the first request's start to the last request's end. |
+| Queued / blocked | Time waiting in the browser before the request can proceed. |
+| DNS / Connect / TLS | Name lookup, TCP connection setup excluding TLS, and TLS negotiation. |
+| Wait / TTFB | Wait for the first response byte after sending the request. This includes the network round trip, proxies, and application processing. |
+| Receive | Time receiving the response, including any time spent waiting for streamed content. |
+| p50 / p95 / p99 | Median, 95th-percentile, and 99th-percentile timing. `n` is the sample count. |
+| Tail | p95 when there are at least 20 samples; otherwise the maximum. |
+| Failure / ProblemRate | Unexpected HTTP 4xx or 5xx responses and network failures. Expected responses and browser cancellations are counted separately. |
+
+Timings are in milliseconds unless another unit is shown. Readable reports show
+p95 with at least 20 samples and p99 with at least 100. Latency statistics exclude
+browser-cache hits, network failures, and requests with unavailable timing or
+unknown cache/network source. Capture notes explain these exclusions.
+
+Domain health is **CRITICAL** when at least two requests failed and the failure
+rate is at least 50%. Otherwise it is **DEGRADED** if there is a server or network
+failure, or the failure rate is at least 10%; remaining domains are **HEALTHY**.
+These labels summarize the capture and do not establish service-wide health.
+
+For example, repeated 502 responses after roughly 60 seconds suggest checking
+proxy timeout settings and backend logs during those waits. The capture does not
+establish whether the underlying cause was an application delay, a connection
+failure, or another condition. Confirm the cause with server-side evidence.
+
+### Missing evidence and redaction
+
+`Not available`, `no data`, or `-` indicates missing evidence in the relevant table.
+Missing cookies, connection IDs, response bodies, or timing phases limit the
+corresponding analysis. Malformed entries can be skipped with a warning; review
+capture notes before relying on totals.
+
+Readable reports and JSON reports hide query values and URL fragments by default.
+Use `--show-query` only when those values are needed and the report will be handled
+appropriately. It exposes query strings and fragments in those reports; event
+exports continue to omit query strings. Session IDs in URL path parameters remain
+redacted. Redaction is not a guarantee that all sensitive data has been removed.
+
+## Adjust the analysis
+
+### Recognize expected responses
+
+Use `--expect STATUS:PATH_GLOB` when a response is normal for your application.
+Quote the rule so the shell does not expand `*`:
+
+```bash
+uv run har-analyze analyze capture.har --expect "401:/api/session"
+```
+
+Rules match the URL path and accept an exact status such as `401` or a class such
+as `3xx`. Repeat `--expect` to add rules. Matching responses remain in request
+counts but are not escalated as failures.
+
+The built-in rules are `401:/SASLogon/*`, `3xx:/SASLogon/*`, and
+`404:*/favicon.ico`. Use `--no-default-expect` to remove them before applying
+your own rules.
+
+### Change detection thresholds
+
+For example, flag endpoints whose tail wait exceeds two seconds and individual
+requests lasting more than ten seconds:
+
+```bash
+uv run har-analyze analyze capture.har --slow-ms 2000 --duration-exceeded-ms 10000
+```
+
+| Option | Default | Detection |
+| --- | --- | --- |
+| `--slow-ms` | `10000` | Endpoint tail wait above this value, using non-5xx responses. |
+| `--duration-exceeded-ms` | `30000` | Individual request duration above this value. |
+| `--blocking-ms` | `5000` | Browser queueing above this value. |
+| `--gap-ms` | `1000` | Idle period above this value with no request in flight. |
+| `--large-payload-bytes` | `1048576` | Response size above this value (1 MiB). |
+| `--large-request-body-bytes` | `102400` | POST or PUT body size above this value (100 KiB). |
+| `--redirect-chain-min-hops` | `3` | Redirect chain with at least this many hops. |
+| `--timeout-cluster-min` | `3` | Minimum failed requests in a timeout cluster. |
+| `--timeout-tolerance-pct` | `2` | Timeout cluster tolerance, expressed as ± percent. |
+
+For custom endpoint grouping, use the repeatable `--path-rule "REGEX=NAME"`
+option to replace fully matching path segments with `{NAME}`. Numeric IDs, UUIDs,
+and long hexadecimal IDs are grouped automatically.
+
+If you already have configuration facts from `sas-casefile config`, pass
+`--config-facts config_facts.json` to compare timeout clusters and session idle
+periods with recorded settings. A matching duration does not verify that a setting
+applies to the affected request.
+
+## Troubleshooting
+
+| Problem | What to check |
+| --- | --- |
+| `uv` or `git` is not found | Install the missing tool, then open a new terminal so PATH changes take effect. |
+| Python cannot be resolved | Confirm Python 3.15 is available for your platform and rerun `uv sync --python 3.15`. Check network access if uv needs to download it. |
+| HAR file cannot be opened | Check the path and permissions. Relative paths are resolved from your current directory. |
+| Invalid JSON or HAR structure | Export the Network log again as HAR. Renaming another file to `.har` does not convert it. |
+| A report cannot be written | Check that the destination directory exists and is writable. |
+| Unknown timezone | Use `UTC`, `local`, or an IANA timezone name available on your system. |
+
+Use `--verbose` for diagnostic logging. For the complete command reference and
+installed version, run:
+
+```bash
+uv run har-analyze --help
+uv run har-analyze analyze --help
+uv run har-analyze version
+```
+
+Successful analysis exits with code `0`, including when the report finds failures.
+Processing errors exit with `1`, invalid command arguments with `2`, and an
+interrupted analysis with `130`.

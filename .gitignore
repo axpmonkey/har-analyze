@@ -2,6 +2,12 @@ uv.lock
 .python-version
 test-har/
 
+# Local tests, scripts, and agent instructions
+/tests/
+/scripts/
+AGENTS.md
+CLAUDE.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

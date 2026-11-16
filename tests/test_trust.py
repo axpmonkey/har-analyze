@@ -1,4 +1,8 @@
-"""Tests for the output-trust work in plan.md; each test names the defect ID it covers."""
+"""Output-trust tests: numbers reconcile and labels claim no more than the capture shows.
+
+The letter-number prefixes in test names (a1, b3, d5 ...) are the original review's
+defect IDs, kept so related tests sort together.
+"""
 
 from __future__ import annotations
 
@@ -300,7 +304,9 @@ def test_b3_browser_cancels_are_not_called_a_gateway_timeout() -> None:
 
 def test_b3_gateway_and_network_timeouts_are_named() -> None:
     gateway = analyze_fixture("timeout_cluster.har")
-    assert "do not establish a timeout" in findings(gateway, "timeout_cluster")[0].summary
+    assert "no setting or error page in the capture confirms it" in (
+        findings(gateway, "timeout_cluster")[0].summary
+    )
     network = analyze([failed(i * 1000, "/api/x", "net::ERR_TIMED_OUT", 30_000) for i in range(3)])
     (finding,) = findings(network, "timeout_cluster")
     assert finding.severity == IssueSeverity.HIGH
@@ -362,9 +368,15 @@ def test_b8_truncated_response_is_critical_with_a_hint() -> None:
         ]
     )
     (issue,) = [i for i in report.issues if i.issue_type == IssueType.NETWORK_ERROR]
-    assert issue.severity == IssueSeverity.CRITICAL
+    # A single failed connection is HIGH: one-offs must not read as an outage.
+    assert issue.severity == IssueSeverity.HIGH
     (finding,) = findings(report, "network_errors")
     assert "cut off mid-stream" in finding.recommendation
+    repeated = analyze(
+        [failed(i * 100, "/api/export", "net::ERR_INCOMPLETE_CHUNKED_ENCODING") for i in range(3)]
+    )
+    assert {i.severity for i in repeated.issues} == {IssueSeverity.CRITICAL}
+    assert findings(repeated, "network_errors")[0].severity == IssueSeverity.CRITICAL
 
 
 def test_b10_error_with_status_is_one_issue() -> None:
@@ -650,6 +662,7 @@ def test_d1_d2_error_origin_compares_headers_and_explains_the_status() -> None:
     assert origin.success_servers == {"Apache": 5}
     assert origin.error_content_types == {"text/html": 3}
     assert "consistent with the errors being produced by a different tier" in origin.reading
+    assert "headers point at: AWS load balancer (Server: awselb/2.0) (3)" in origin.reading
     assert "a proxy got no valid answer from the backend" in origin.status_hint
     assert "did not wait on the application" not in origin.status_hint
     markdown = OutputFormatter().generate_markdown_report(report, "x.har")
@@ -758,7 +771,7 @@ def test_d5_backend_node_from_session_route() -> None:
 @pytest.mark.parametrize(
     ("headers", "expected"),
     [
-        ([("Set-Cookie", "ROUTEID=.tc2; path=/")], ("tc2", "ROUTEID cookie")),
+        ([("Set-Cookie", "ROUTEID=.tc2; path=/")], ("tc2", "ROUTEID (Set-Cookie)")),
         ([("X-Served-By", "cache-lhr-1")], ("cache-lhr-1", "X-Served-By")),
         ([("Set-Cookie", "JSESSIONID=ABCDEF; Path=/")], None),  # no route suffix
         ([], None),
@@ -794,7 +807,7 @@ def test_d7_correlation_ids_are_on_issues() -> None:
     errors = [i for i in report.issues if i.issue_type == IssueType.SERVER_ERROR]
     assert [i.details["correlation"] for i in errors] == [f"x-request-id=req-{i}" for i in range(3)]
     markdown = OutputFormatter().generate_markdown_report(report, "x.har")
-    assert "correlation: x-request-id=req-0" in markdown
+    assert "Correlation IDs: x-request-id=req-0" in markdown
 
 
 # --- output consistency -------------------------------------------------------

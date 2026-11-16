@@ -36,15 +36,15 @@ def test_timing_semantics_ssl_not_double_counted() -> None:  # P0.1
     assert report.ssl_timings.total_duration_ms == 200
     phases = {p.phase_name: p.total_ms for p in report.phase_breakdown}
     assert phases == {
-        "Blocked": 0,
+        "Queued in browser": 0,
         "DNS": 0,
         "Connect (excl. TLS)": 100,
-        "SSL": 200,
+        "TLS": 200,
         "Send": 0,
-        "TTFB": 8500,  # 600 + 7900
+        "Wait / TTFB": 8500,  # 600 + 7900
         "Receive": 300,  # 3 x 100
     }
-    ttfb_share = next(p for p in report.phase_breakdown if p.phase_name == "TTFB")
+    ttfb_share = next(p for p in report.phase_breakdown if p.phase_name == "Wait / TTFB")
     assert ttfb_share.percentage_of_total == pytest.approx(8500 / 9100 * 100)
     # network total = dns 0 + connect-excl-TLS 100 + ssl 200 + receive 100 = 400 (was 600)
     endpoint_net = {
@@ -169,7 +169,8 @@ def test_aborted_requests_only_reset_is_an_error() -> None:
     by_type = {i.issue_type: i for i in report.issues}
     assert set(by_type) == {IssueType.NETWORK_ERROR, IssueType.REQUEST_ABORTED}
     assert by_type[IssueType.NETWORK_ERROR].url.endswith("/reports/data")
-    assert by_type[IssueType.NETWORK_ERROR].severity == IssueSeverity.CRITICAL
+    # one failed connection is HIGH; CRITICAL needs the host to fail repeatedly
+    assert by_type[IssueType.NETWORK_ERROR].severity == IssueSeverity.HIGH
     assert by_type[IssueType.REQUEST_ABORTED].url.endswith("/reports/poll")
     assert by_type[IssueType.REQUEST_ABORTED].severity == IssueSeverity.LOW
 
@@ -183,7 +184,7 @@ def test_aborted_requests_domain_health_counts_only_real_failures() -> None:
 
 
 def test_aborted_requests_outage_is_the_reset_endpoint_only() -> None:
-    # One failed request is a failure, not an outage (plan.md B1): it is reported as a
+    # One failed request is a failure, not an outage (B1): it is reported as a
     # network error and in the service table, and the aborted poll is in neither.
     report = analyze_fixture("aborted_requests.har")
     assert all(f.category != "outage" for f in report.key_findings)
@@ -204,9 +205,11 @@ def test_aborted_requests_outage_is_the_reset_endpoint_only() -> None:
 def test_timeout_cluster_found_once() -> None:
     (cluster,) = analyze_fixture("timeout_cluster.har").timeout_clusters
     assert cluster.request_count == 8
-    assert (cluster.min_ms, cluster.max_ms) == (60000, 60400)
-    assert cluster.median_ms == 60175  # (60150 + 60200) / 2
-    assert cluster.round_value_s == 60.175
+    # R37: measured on wait for the first byte (total minus the 10 ms receive phase)
+    assert cluster.basis == "wait"
+    assert (cluster.min_ms, cluster.max_ms) == (59990, 60390)
+    assert cluster.median_ms == 60165  # (60140 + 60190) / 2
+    assert cluster.round_value_s == 60.165
     assert cluster.status_codes == {502: 8}
     assert cluster.endpoints == {"POST https://sas.example.com/SASStoredProcess/do": 8}
     assert cluster.matching_settings == []
@@ -226,7 +229,9 @@ def test_timeout_cluster_names_matching_config_setting() -> None:
 def test_timeout_cluster_findings_lead_with_backend_signals() -> None:
     report = analyze_fixture("timeout_cluster.har")
     categories = [f.category for f in report.key_findings if not f.frontend]
-    assert categories[:3] == ["outage", "domain_health", "server_errors"]
+    assert categories[0] == "outage"
+    # R41: a domain whose failures are already named as an outage is not reported again
+    assert "domain_health" not in categories
     assert "timeout_cluster" in categories
     assert "server_errors" in categories
 

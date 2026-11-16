@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from har_analyze.cli import AnalyzerSettings, ConfigFact, Har, HarAnalysisReport, HarAnalyzer
+from har_analyze.cli import load_har as load_har_document
 
 FIXTURES = Path(__file__).parent / "fixtures"
 T0 = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
@@ -17,7 +18,7 @@ T0 = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
 
 def load_har(name: str) -> Har:
     """Parse a fixture HAR file."""
-    return Har.model_validate(json.loads((FIXTURES / name).read_text(encoding="utf-8")))
+    return load_har_document(json.loads((FIXTURES / name).read_text(encoding="utf-8")))
 
 
 def analyze_fixture(
@@ -81,7 +82,7 @@ def make_entry(  # noqa: PLR0913
 
 def make_har(entries: list[dict[str, Any]]) -> Har:
     """Wrap raw entries into a Har model."""
-    return Har.model_validate({"log": {"entries": entries}})
+    return load_har_document({"log": {"entries": entries}})
 
 
 def write_har(path: Path, entries: list[dict[str, Any]]) -> Path:

@@ -121,7 +121,7 @@ def test_domain_health_needs_two_problems_for_critical() -> None:
             + [make_entry(4000, f"{HOST}/a", 500)]
         )
     )
-    # 1/20 = 5% < 10%, but any 5xx makes a domain at least DEGRADED (plan.md B4)
+    # 1/20 = 5% < 10%, but any 5xx makes a domain at least DEGRADED (B4)
     assert sporadic.domains[0].health == DomainHealth.DEGRADED
 
 
@@ -177,8 +177,11 @@ def test_failure_duration_cluster_does_not_require_round_value() -> None:
     # Similar failures are observed even when not near a guessed timeout setting.
     entries = [make_entry(i * 1000, f"{HOST}/x", 502, 37000 + i * 50) for i in range(5)]
     (cluster,) = HarAnalyzer().analyze(make_har(entries)).timeout_clusters
-    assert cluster.kind == "failure"
-    assert cluster.median_ms == 37100
+    # R37/R38: a 5xx is measured by its wait (total - 10 ms receive in make_entry), and a
+    # 502 cluster is named as such: httpd answers 502 when its proxy read timeout expires.
+    assert cluster.kind == "proxy_502"
+    assert cluster.basis == "wait"
+    assert cluster.median_ms == 37090
 
 
 # --- P1.5 path templating -----------------------------------------------------
@@ -217,7 +220,7 @@ def test_format_percentiles_suppresses_tail_under_20() -> None:
     small = analyzer._compute_timing_stats([float(v) for v in range(1, 6)])
     assert format_percentiles(small) == "p50 3ms / max 5ms (n=5; p95/p99 need n≥20)"
     large = analyzer._compute_timing_stats([float(v) for v in range(1, 21)])
-    # p99 is only printed from n >= 100 (plan.md B14)
+    # p99 is only printed from n >= 100 (B14)
     assert format_percentiles(large).endswith("max 20ms (n=20; p99 needs n≥100)")
     assert "p95 19ms" in format_percentiles(large)  # 19 * 0.95 = 18.05 -> 19 + 0.05*1
 
@@ -283,7 +286,7 @@ def test_server_timing_per_endpoint() -> None:
     assert endpoint.server_timings["app"].count == 3
     assert endpoint.server_timings["app"].p50 == 101
     markdown = OutputFormatter().generate_markdown_report(report, "x.har")
-    assert "## Server-Reported Timing vs TTFB" in markdown
+    assert "## Server-Reported Timing vs Wait (TTFB)" in markdown
 
 
 # --- P2.1 events --------------------------------------------------------------
@@ -391,7 +394,7 @@ def test_connection_reuse_http2_wording() -> None:
         raw["request"]["httpVersion"] = "h2"
     report = HarAnalyzer().analyze(make_har(entries))
     # The capture-wide "reuse efficiency" finding was replaced by per-host connection
-    # churn (plan.md B16); connection IDs are still summarised.
+    # churn (B16); connection IDs are still summarised.
     assert all(f.category != "connection_reuse" for f in report.key_findings)
     stats = report.connection_reuse_stats
     assert stats is not None
@@ -523,7 +526,7 @@ def test_cli_terminal_report_all_sections(tmp_path: Path) -> None:
         "Backend/API Service Health",
         "Backend/API Errors by Domain",
         "Informational (redirects, aborts)",
-        "Server-Reported Timing vs TTFB",
+        "Server-Reported Timing vs Wait (TTFB)",
         "Error Runs",
         "Slowest Individual Requests",
         "Connections per Host",
@@ -609,7 +612,7 @@ def test_cli_rules_and_thresholds(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     markdown = md_path.read_text()
-    assert "slow endpoint > 5000ms" in markdown
+    assert "slow endpoint: wait for first byte > 5000ms" in markdown
     # favicon 404 now a failure (static, so not in the backend error list); only the
     # 401 matches a rule (the default 3xx:/SASLogon/* was dropped): 1/6 = 16.7%
     # columns: requests, failures, rate, 5xx, network errors, expected, aborted

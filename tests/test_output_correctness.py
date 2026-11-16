@@ -93,7 +93,7 @@ def test_short_timeout_cluster_is_detected() -> None:
     entries = [make_entry(index * 1000, f"{HOST}/api", 504, 2000) for index in range(3)]
     report = HarAnalyzer().analyze(load_har({"log": {"entries": entries}}))
     assert len(report.timeout_clusters) == 1
-    assert report.timeout_clusters[0].median_ms == 2000
+    assert report.timeout_clusters[0].median_ms == 1990  # wait = total - 10 ms receive
 
 
 def test_timeout_match_requires_relevant_semantics() -> None:

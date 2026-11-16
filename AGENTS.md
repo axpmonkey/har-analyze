@@ -45,11 +45,13 @@ HAR Analyze is a Python package that parses HAR 1.2 files captured from browser 
 
 ## Toolchain
 
-- **Python**: 3.11-3.15
+- **Python**: 3.15 only
 - **Formatter/Linter**: `ruff format` and `ruff check --fix`
 - **Type checker**: `basedpyright` (strict)
 - **Tests**: `pytest` with branch coverage >= 90%; optional `hypothesis`
-- **Packaging**: `pyproject.toml` as single source of truth; `uv` exclusively (no pip/poetry/conda)
+- **Packaging**: `pyproject.toml` as single source of truth; `uv` exclusively.
+- **Dependencies**: Latest compatible releases of all runtime dependencies and tools.
+  Do not preserve old versions or require a lockfile as a prerequisite.
 - **Bash tools**: `rg`, `fd`, `bat`, `jq` only (no grep/find)
 
 ---
@@ -59,17 +61,18 @@ HAR Analyze is a Python package that parses HAR 1.2 files captured from browser 
 Run in sequence; **all must pass** before committing:
 
 ```bash
-uv sync --frozen
-ruff format --check
-ruff check
-basedpyright
-pytest -q --cov=src/<package> --cov-branch --cov-fail-under=90
-pip-audit  # or osv-scanner; fail on critical vulnerabilities
+uv sync --upgrade --extra dev --python 3.15
+uv run --no-sync ruff format --check
+uv run --no-sync ruff check
+uv run --no-sync basedpyright
+uv run --no-sync pytest -q --cov=src/har_analyze --cov-branch --cov-fail-under=90
+uv run --no-sync pip-audit  # fail on vulnerabilities
 ```
 
 Environment: `TZ=UTC`, `PYTHONUTF8=1`, `LC_ALL=C.UTF-8`, `PYTHONWARNINGS=error`
 
-Matrix across Python 3.11-3.15. Cache `uv` environments. Commit `uv.lock`.
+Verify on Python 3.15 only. Use the latest compatible runtime dependencies and development tools;
+refresh them with `uv sync --upgrade --extra dev --python 3.15` before verification.
 
 ---
 
@@ -79,7 +82,6 @@ Matrix across Python 3.11-3.15. Cache `uv` environments. Commit `uv.lock`.
 src/<package_name>/    # All package code
 tests/                 # All tests (outside src/)
 pyproject.toml         # Single config file (all tool settings live here)
-uv.lock                # Committed lockfile
 ```
 
 - Prefer relative imports within a package; do not mutate `sys.path`.
@@ -94,7 +96,7 @@ uv.lock                # Committed lockfile
 - Complete type hints on all code; `from __future__ import annotations`.
 - No implicit `Any`. No `# type: ignore` without justification.
 - Prefer `Protocol` for behavioral contracts; use `Self`, `ParamSpec`, `TypeVarTuple` as appropriate.
-- PEP 695 syntax when minimum version is >= 3.12; otherwise `TypeVar`/`ParamSpec`.
+- Use Python 3.15 typing syntax, including PEP 695 for generic declarations.
 
 ### I/O & HTTP
 - Use `pathlib.Path` for filesystem work.
@@ -103,7 +105,7 @@ uv.lock                # Committed lockfile
 - Access package data via `importlib.resources`.
 
 ### Data
-- Prefer `pydantic>=2` or `msgspec` for validation/serialization.
+- Use the latest Pydantic for validation/serialization.
 - Parameterized SQL only; never format/concatenate SQL with variables.
 - Config via `pydantic-settings` (env + optional .env); env overrides file.
 

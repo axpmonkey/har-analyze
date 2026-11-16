@@ -11,6 +11,7 @@ __version__ = "0.1.0"
 import hashlib
 import json
 import logging
+import math
 import re
 import statistics
 from collections import defaultdict
@@ -25,13 +26,17 @@ from urllib.parse import parse_qsl, urljoin, urlparse, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import typer
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.markup import escape as rich_escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.tree import Tree
+
+HTTP_STATUS_MIN = 100
+HTTP_STATUS_NOT_MODIFIED = 304
+HTTP_STATUS_GATEWAY_TIMEOUT = 504
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -132,28 +137,45 @@ class HarRequest(LenientHarModel):
     url: str
     http_version: str = Field("", alias="httpVersion")
     headers: list[HarHeader] = Field(default_factory=list[HarHeader])
-    body_size: int = Field(-1, alias="bodySize")
+    body_size: int = Field(-1, alias="bodySize", ge=-1)
     post_data: HarPostData | None = Field(None, alias="postData")
+
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if parsed.scheme.lower() in NETWORK_URL_SCHEMES:
+            if not parsed.hostname or parsed.username or parsed.password:
+                raise ValueError("network URL requires a host and must not contain credentials")
+            _ = parsed.port  # validates malformed and out-of-range ports
+        return value
 
 
 class HarContent(LenientHarModel):
     """Response body details (``size`` is the uncompressed length)."""
 
-    size: int = -1
+    size: int = Field(default=-1, ge=-1)
     mime_type: str = Field("", alias="mimeType")
 
 
 class HarResponse(LenientHarModel):
     """HTTP response."""
 
-    status: int
+    status: int = Field(ge=0, le=599)
     status_text: str = Field("", alias="statusText")
     headers: list[HarHeader] = Field(default_factory=list[HarHeader])
     redirect_url: str = Field("", alias="redirectURL")
-    body_size: int = Field(-1, alias="bodySize")  # bytes on the wire (compressed)
+    body_size: int = Field(-1, alias="bodySize", ge=-1)  # body bytes on the wire
     content: HarContent | None = None
-    transfer_size: int | None = Field(None, alias="_transferSize")
+    transfer_size: int | None = Field(None, alias="_transferSize", ge=-1)
     error: str | None = Field(None, alias="_error")
+
+    @field_validator("status")
+    @classmethod
+    def _validate_status(cls, value: int) -> int:
+        if 0 < value < HTTP_STATUS_MIN:
+            raise ValueError("status must be 0 (no response) or 100 through 599")
+        return value
 
 
 class HarCache(LenientHarModel):
@@ -183,7 +205,7 @@ class HarTimings(LenientHarModel):
         if self.connect < 0:
             return -1.0
         if self.ssl >= 0:
-            return max(self.connect - self.ssl, 0.0)
+            return self.connect - self.ssl if self.ssl <= self.connect else -1.0
         return self.connect
 
     @property
@@ -209,6 +231,8 @@ class HarEntry(LenientHarModel):
     started_date_time_raw: str = ""  # startedDateTime exactly as written in the HAR
     timestamp_assumed_utc: bool = False  # startedDateTime had no UTC offset
     entry_index: int = 0  # 1-based position in the HAR file (0 = not loaded via load_har)
+    duration_source: str = "recorded"
+    timing_warnings: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -218,17 +242,53 @@ class HarEntry(LenientHarModel):
         raw = dict(cast("dict[str, Any]", data))
         if "startedDateTime" in raw and "started_date_time_raw" not in raw:
             raw["started_date_time_raw"] = str(raw["startedDateTime"])
+        warnings = list(cast("list[str]", raw.get("timing_warnings", [])))
+        raw_timings: object = raw.get("timings")
+        if raw_timings is None:
+            raw_timings = {}
+        if not isinstance(raw_timings, dict):
+            raise ValueError("timings must be an object")
+        phases = dict(cast("dict[str, Any]", raw_timings))
+        for name in ("blocked", "dns", "connect", "ssl", "send", "wait", "receive"):
+            value = phases.get(name)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(value)
+                or (value < 0 and value != -1)
+            ):
+                phases[name] = -1
+                warnings.append(f"invalid {name} timing excluded")
+        raw["timings"] = phases
         if raw.get("time") is None:
-            # No total recorded: use the sum of the recorded phases (ssl is inside connect).
-            timings = raw.get("timings")
-            phases: dict[str, Any] = (
-                cast("dict[str, Any]", timings) if isinstance(timings, dict) else {}
-            )
-            raw["time"] = sum(
-                float(value)
-                for name in ("blocked", "dns", "connect", "send", "wait", "receive")
-                if isinstance(value := phases.get(name), int | float) and value >= 0
-            )
+            # Derive only when all mandatory phases are recorded. A partial sum is
+            # a lower bound, not a measured request duration.
+            if all(
+                isinstance(phases.get(name), int | float) and phases[name] >= 0
+                for name in ("send", "wait", "receive")
+            ):
+                raw["time"] = sum(
+                    value
+                    for name, value in phases.items()
+                    if name in ("blocked", "dns", "connect", "send", "wait", "receive")
+                    and isinstance(value, int | float)
+                    and value >= 0
+                )
+                raw["duration_source"] = "derived"
+            else:
+                raw["time"] = -1
+                raw["duration_source"] = "unavailable"
+                warnings.append("total timing unavailable")
+        elif (
+            isinstance(raw["time"], bool)
+            or not isinstance(raw["time"], int | float)
+            or not math.isfinite(raw["time"])
+            or raw["time"] < 0
+        ):
+            raw["time"] = -1
+            raw["duration_source"] = "unavailable"
+            warnings.append("invalid total timing excluded")
+        raw["timing_warnings"] = warnings
         return raw
 
     @model_validator(mode="after")
@@ -236,6 +296,30 @@ class HarEntry(LenientHarModel):
         if self.started_date_time.tzinfo is None:
             self.started_date_time = self.started_date_time.replace(tzinfo=UTC)
             self.timestamp_assumed_utc = True
+        try:
+            _ = self.started_date_time + timedelta(milliseconds=max(self.time, 0))
+            _ = self.started_date_time + timedelta(
+                milliseconds=self.timings.before_response_headers_ms
+            )
+        except OverflowError, ValueError:
+            self.time = -1
+            self.duration_source = "unavailable"
+            self.timings = HarTimings()
+            self.timing_warnings.append("timing outside representable timestamp range excluded")
+        if self.timings.ssl > self.timings.connect >= 0:
+            self.timing_warnings.append("TLS exceeds connect; exclusive connect timing unavailable")
+        phases = (
+            self.timings.blocked,
+            self.timings.dns,
+            self.timings.connect,
+            self.timings.send,
+            self.timings.wait,
+            self.timings.receive,
+        )
+        if self.time >= 0 and all(value >= 0 for value in phases[3:]):
+            phase_sum = sum(value for value in phases if value >= 0)
+            if not math.isclose(self.time, phase_sum, rel_tol=0.01, abs_tol=1):
+                self.timing_warnings.append("total timing differs from recorded phase sum")
         return self
 
 
@@ -344,15 +428,15 @@ DEFAULT_EXPECTED_RULES: tuple[str, ...] = (
 class AnalyzerSettings(BaseModel):
     """User-tunable thresholds and rules (printed in every report)."""
 
-    slow_endpoint_ms: float = 10_000
-    duration_exceeded_ms: float = 30_000
-    large_payload_bytes: int = 1_048_576
-    blocking_ms: float = 5_000
-    idle_gap_ms: float = 1_000
-    large_request_body_bytes: int = 102_400
-    redirect_chain_min_hops: int = 3
-    timeout_cluster_min_requests: int = 3
-    timeout_cluster_tolerance_pct: float = 2.0
+    slow_endpoint_ms: float = Field(default=10_000, ge=0, allow_inf_nan=False)
+    duration_exceeded_ms: float = Field(default=30_000, ge=0, allow_inf_nan=False)
+    large_payload_bytes: int = Field(default=1_048_576, ge=0)
+    blocking_ms: float = Field(default=5_000, ge=0, allow_inf_nan=False)
+    idle_gap_ms: float = Field(default=1_000, ge=0, allow_inf_nan=False)
+    large_request_body_bytes: int = Field(default=102_400, ge=0)
+    redirect_chain_min_hops: int = Field(default=3, ge=1)
+    timeout_cluster_min_requests: int = Field(default=3, ge=2)
+    timeout_cluster_tolerance_pct: float = Field(default=2.0, gt=0, le=100, allow_inf_nan=False)
     expected_rules: list[str] = Field(default_factory=lambda: list(DEFAULT_EXPECTED_RULES))
     path_rules: list[str] = Field(default_factory=list)
 
@@ -428,6 +512,7 @@ def template_path(path: str, rules: tuple[PathTemplateRule, ...] = ()) -> str:
     User rules are tried first, then UUID -> ``{uuid}``, all digits -> ``{n}``,
     hex of 16+ chars -> ``{hex}``.
     """
+    path = re.sub(r"(?i);jsessionid=[^/;?#]*", ";jsessionid=<redacted>", path)
     templated: list[str] = []
     for segment in (path or "/").split("/"):
         replacement = segment
@@ -457,7 +542,7 @@ def redact_url(url: str, *, show_query: bool = False) -> str:
     ``access_token=`` in the query or fragment, so values are hidden by default.
     """
     parts = urlsplit(url)
-    path = parts.path or "/"
+    path = re.sub(r"(?i);jsessionid=[^/;?#]*", ";jsessionid=<redacted>", parts.path or "/")
     if show_query:
         query = f"?{parts.query}" if parts.query else ""
         fragment = f"#{parts.fragment}" if parts.fragment else ""
@@ -583,8 +668,28 @@ def is_real_network_error(entry: HarEntry) -> bool:
     return category is not None and category not in INFORMATIONAL_ERROR_CATEGORIES
 
 
-_SERVER_TIMING_DUR_RE = re.compile(r"(?:^|;)\s*dur\s*=\s*\"?([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+_SERVER_TIMING_DUR_RE = re.compile(r'\s*dur\s*=\s*"?([0-9]+(?:\.[0-9]+)?)"?\s*', re.I)
 _DURATION_WITH_UNIT_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*(ms|s|sec|seconds)?\s*$", re.I)
+
+
+def _split_header_fields(value: str, delimiter: str) -> list[str]:
+    """Split HTTP list/parameter fields without interpreting quoted delimiters."""
+    fields: list[str] = []
+    start = 0
+    quoted = False
+    escaped = False
+    for position, character in enumerate(value):
+        if escaped:
+            escaped = False
+        elif quoted and character == "\\":
+            escaped = True
+        elif character == '"':
+            quoted = not quoted
+        elif character == delimiter and not quoted:
+            fields.append(value[start:position])
+            start = position + 1
+    fields.append(value[start:])
+    return fields
 
 
 def parse_server_timings(headers: list[HarHeader]) -> dict[str, float]:
@@ -597,18 +702,25 @@ def parse_server_timings(headers: list[HarHeader]) -> dict[str, float]:
     for header in headers:
         name = header.name.lower()
         if name == "server-timing":
-            for metric in header.value.split(","):
-                metric_name = metric.split(";", 1)[0].strip()
-                match = _SERVER_TIMING_DUR_RE.search(metric)
-                if metric_name and match:
-                    timings[metric_name] = float(match.group(1))
+            for metric in _split_header_fields(header.value, ","):
+                metric_name, *parameters = _split_header_fields(metric, ";")
+                metric_name = metric_name.strip()
+                for parameter in parameters:
+                    match = _SERVER_TIMING_DUR_RE.fullmatch(parameter)
+                    if metric_name and match:
+                        duration = float(match.group(1))
+                        if math.isfinite(duration):
+                            timings.setdefault(metric_name, duration)
+                        break
         elif name in ("x-response-time", "x-runtime"):
             match = _DURATION_WITH_UNIT_RE.match(header.value)
             if not match:
                 continue
             value = float(match.group(1))
             unit = (match.group(2) or ("s" if name == "x-runtime" else "ms")).lower()
-            timings[header.name] = value if unit == "ms" else value * 1000
+            duration = value if unit == "ms" else value * 1000
+            if math.isfinite(duration):
+                timings.setdefault(header.name, duration)
     return timings
 
 
@@ -700,10 +812,9 @@ def long_lived_kind(entry: HarEntry) -> str | None:
 
 
 def request_active_ms(entry: HarEntry) -> float:
-    """Total time minus time queued in the browser before the request was sent.
+    """Total minus recorded queueing; still includes setup, upload and download.
 
-    A proxy or server timeout runs from when the request reaches it, so queueing
-    (``blocked``) must be removed before comparing durations with timeout settings.
+    This is not the duration seen by a proxy or application execution timer.
     """
     return max(entry.time - max(entry.timings.blocked, 0.0), 0.0)
 
@@ -819,7 +930,7 @@ def timeout_fact_seconds(fact: ConfigFact) -> float | None:
         if match:
             number = float(match.group(1)) if number is None else number
             unit = unit or match.group(2).lower()
-    if number is None:
+    if number is None or not math.isfinite(number) or number <= 0:
         return None
     if not unit:
         unit = _default_timeout_unit(fact.component.lower(), key_lower) or ""
@@ -835,6 +946,23 @@ def describe_fact(fact: ConfigFact) -> str:
         location += f":{fact.line}"
     suffix = f" ({location})" if location else ""
     return f"{fact.component} {fact.key}={fact.value}{suffix}".strip()
+
+
+def timeout_fact_applies_to_response_wait(fact: ConfigFact) -> bool:
+    """Allow only known response-wait timers as duration-comparison candidates.
+
+    These timers have different start/reset conditions. A duration match never
+    establishes that the setting applied to the captured request or caused it to fail.
+    """
+    key = re.split(r"[./\s]", fact.key.lower())[-1]
+    component = fact.component.lower()
+    return (
+        (component in ("httpd", "apache") and key in ("proxytimeout", "timeout"))
+        or (component == "nginx" and key == "proxy_read_timeout")
+        or (component in ("mod_jk", "jk") and key == "reply_timeout")
+        or (component == "haproxy" and fact.key.lower() in ("timeout server", "timeout tunnel"))
+        or (component == "tomcat" and key == "asynctimeout")
+    )
 
 
 def load_config_facts(path: Path) -> list[ConfigFact]:
@@ -911,6 +1039,7 @@ class EndpointStats(BaseModel):
     """Aggregated statistics for an endpoint."""
 
     url_pattern: str
+    method: str = ""
     count: int
     timings: TimingStatistics
     blocked_timings: TimingStatistics
@@ -1042,7 +1171,8 @@ class CacheAnalysis(BaseModel):
     cacheable_get_count: int  # browser cache hits + 304s + network 200s
     not_modified_count: int = 0  # 304 responses
     browser_cache_hit_count: int = 0  # served from memory/disk cache
-    network_download_count: int = 0  # 200 responses fetched over the network
+    network_download_count: int = 0  # 200 responses with evidence of network activity
+    unknown_cache_count: int = 0  # 200 responses lacking sufficient evidence
     repeated_download_request_count: int = 0  # network 200s for a URL fetched 2+ times
     repeated_downloads: list[dict[str, Any]]  # [{url, count, total_bytes}]
     missing_cache_control_count: int
@@ -1092,14 +1222,11 @@ class RequestSummary(BaseModel):
     receive_ms: float
     error_category: str | None = None
     correlation: dict[str, str] = Field(default_factory=dict)
+    entry_index: int = 0
 
 
 class TimeoutCluster(BaseModel):
-    """Failed requests whose durations bunch up at a round value (likely a timeout).
-
-    Durations are measured from when the request was sent (total minus browser
-    queueing), which is what a proxy or server timeout sees.
-    """
+    """Similar failure durations excluding recorded queueing; causes remain hypotheses."""
 
     kind: str  # "gateway" (5xx), "network" (no response), "client_cancel" (all aborted)
     max_queued_ms: float = 0.0  # longest browser queueing among the members
@@ -1132,6 +1259,8 @@ class LatencyPopulation(BaseModel):
     browser_cache_hit_count: int
     aborted_count: int
     network_error_count: int
+    timing_unavailable_count: int = 0
+    cache_source_unknown_count: int = 0
 
 
 class ErrorOrigin(BaseModel):
@@ -1220,6 +1349,14 @@ class HarAnalysisReport(BaseModel):
     error_origins: list[ErrorOrigin] = Field(default_factory=list)
     clock_offsets: list[HostClockOffset] = Field(default_factory=list)
     backend_nodes: list[BackendNodeStats] = Field(default_factory=list)
+    timing_warning_count: int = 0
+    timing_warning_examples: list[str] = Field(default_factory=list)
+    derived_duration_count: int = 0
+    unavailable_duration_count: int = 0
+    transfer_unknown_count: int = 0
+    transfer_body_only_count: int = 0
+    backend_unknown_request_count: int = 0
+    backend_unknown_failure_count: int = 0
 
 
 # =============================================================================
@@ -1307,11 +1444,35 @@ class HarAnalyzer:
         Browser-cache hits (about 0 ms) and requests that never got a response would
         distort latency percentiles, so those are counted separately.
         """
-        return classify_network_error(entry) is None and not self.is_browser_cache_hit(entry)
+        return (
+            entry.time >= 0
+            and classify_network_error(entry) is None
+            and not self.is_browser_cache_hit(entry)
+            and not self.is_cache_source_unknown(entry)
+        )
+
+    @staticmethod
+    def is_cache_source_unknown(entry: HarEntry) -> bool:
+        """A 200 without local-cache or positive network evidence has unknown source."""
+        return (
+            entry.response.status == HTTP_STATUS_OK
+            and not HarAnalyzer.is_browser_cache_hit(entry)
+            and HarAnalyzer.transferred_bytes(entry) == 0
+            and not any(
+                value > 0
+                for value in (
+                    entry.timings.dns,
+                    entry.timings.connect,
+                    entry.timings.send,
+                    entry.timings.wait,
+                    entry.timings.receive,
+                )
+            )
+        )
 
     def path_template(self, url: str) -> str:
         """Return the URL path with ID-like segments templated."""
-        return template_path(urlparse(url).path or "/", self.path_rules)
+        return template_path(urlsplit(url).path or "/", self.path_rules)
 
     def endpoint_key(self, url: str) -> str:
         """Return ``scheme://host/templated/path`` used to group requests."""
@@ -1321,7 +1482,7 @@ class HarAnalyzer:
     @staticmethod
     def transferred_bytes(entry: HarEntry) -> int:
         """Bytes that crossed the network (0 for browser-cache hits)."""
-        if entry.from_cache:
+        if HarAnalyzer.is_browser_cache_hit(entry):
             return 0
         transfer_size = entry.response.transfer_size
         if transfer_size is not None and transfer_size >= 0:
@@ -1332,12 +1493,12 @@ class HarAnalyzer:
     def is_browser_cache_hit(entry: HarEntry) -> bool:
         """Return True when the browser served the response from memory/disk cache.
 
-        Signals: Chrome's ``_fromCache``, the standard ``cache.beforeRequest`` (Firefox),
-        or a 200 with ``_transferSize`` 0.
+        Signals: known memory/disk ``_fromCache`` values, or a 200 with
+        ``_transferSize`` 0. ``cache.beforeRequest`` is metadata, not proof of a hit.
         """
-        if entry.from_cache:
-            return True
-        if entry.cache is not None and entry.cache.before_request is not None:
+        if entry.response.status == HTTP_STATUS_NOT_MODIFIED:
+            return False
+        if entry.from_cache in ("memory", "disk", "memory-cache", "disk-cache"):
             return True
         return (
             entry.response.status == HTTP_STATUS_OK
@@ -1382,7 +1543,7 @@ class HarAnalyzer:
 
         report = HarAnalysisReport(
             total_requests=len(entries),
-            total_duration_ms=sum(e.time for e in entries),
+            total_duration_ms=sum(e.time for e in entries if e.time >= 0),
             total_bytes_transferred=sum(self.transferred_bytes(e) for e in entries),
             overall_timings=self._compute_timing_stats([e.time for e in measured]),
             blocked_timings=phase_stats["Blocked"],
@@ -1435,11 +1596,50 @@ class HarAnalyzer:
                 ),
                 aborted_count=aborted_request_count,
                 network_error_count=sum(network_errors_by_category.values()),
+                timing_unavailable_count=sum(
+                    1
+                    for e in entries
+                    if e.time < 0
+                    and classify_network_error(e) is None
+                    and not self.is_browser_cache_hit(e)
+                ),
+                cache_source_unknown_count=sum(
+                    e.time >= 0
+                    and classify_network_error(e) is None
+                    and self.is_cache_source_unknown(e)
+                    for e in entries
+                ),
             ),
             host_connection_stats=self._host_connection_stats(measured),
             error_origins=self._error_origins(entries),
             clock_offsets=self._clock_offsets(measured),
             backend_nodes=self._backend_nodes(entries),
+            timing_warning_count=sum(bool(e.timing_warnings) for e in entries),
+            timing_warning_examples=[
+                f"entry {e.entry_index}: {'; '.join(e.timing_warnings)}"
+                for e in entries
+                if e.timing_warnings
+            ][:5],
+            derived_duration_count=sum(e.duration_source == "derived" for e in entries),
+            unavailable_duration_count=sum(e.time < 0 for e in entries),
+            transfer_unknown_count=sum(
+                not self.is_browser_cache_hit(e)
+                and e.response.body_size < 0
+                and (e.response.transfer_size is None or e.response.transfer_size < 0)
+                for e in entries
+            ),
+            transfer_body_only_count=sum(
+                not self.is_browser_cache_hit(e)
+                and e.response.body_size >= 0
+                and (e.response.transfer_size is None or e.response.transfer_size < 0)
+                for e in entries
+            ),
+            backend_unknown_request_count=sum(self.backend_node(e) is None for e in entries),
+            backend_unknown_failure_count=sum(
+                self.backend_node(e) is None
+                and self.outcome(e) in (RequestOutcome.SERVER_ERROR, RequestOutcome.NETWORK_ERROR)
+                for e in entries
+            ),
         )
         report.key_findings = self._generate_key_findings(report)
         return report
@@ -1497,6 +1697,7 @@ class HarAnalyzer:
                 receive_ms=e.timings.receive,
                 error_category=classify_network_error(e),
                 correlation=correlation_headers(e),
+                entry_index=e.entry_index,
             )
             for e in slowest[: self.SLOWEST_REQUESTS_LIMIT]
         ]
@@ -1661,15 +1862,17 @@ class HarAnalyzer:
         ``count`` and ``status_codes`` cover every request; timing statistics cover the
         requests answered over the network.
         """
-        by_pattern: dict[str, list[HarEntry]] = defaultdict(list)
+        by_pattern: dict[tuple[str, str], list[HarEntry]] = defaultdict(list)
         for entry in entries:
-            by_pattern[self.endpoint_key(entry.request.url)].append(entry)
+            by_pattern[(entry.request.method.upper(), self.endpoint_key(entry.request.url))].append(
+                entry
+            )
 
         def stats(values: list[float]) -> TimingStatistics:
             return self._compute_timing_stats([value for value in values if value >= 0])
 
         endpoints: list[EndpointStats] = []
-        for pattern, reqs in by_pattern.items():
+        for (method, pattern), reqs in by_pattern.items():
             status_dist: dict[int, int] = defaultdict(int)
             for req in reqs:
                 status_dist[req.response.status] += 1
@@ -1690,6 +1893,7 @@ class HarAnalyzer:
             endpoints.append(
                 EndpointStats(
                     url_pattern=pattern,
+                    method=method,
                     count=len(reqs),
                     timings=self._compute_timing_stats([r.time for r in measured]),
                     blocked_timings=stats([r.timings.blocked for r in measured]),
@@ -1724,7 +1928,7 @@ class HarAnalyzer:
                 )
             )
 
-        return sorted(endpoints, key=lambda e: (-tail_value(e.timings), e.url_pattern))
+        return sorted(endpoints, key=lambda e: (-tail_value(e.timings), e.url_pattern, e.method))
 
     # -------------------------------------------------------------------------
     # Issue detection
@@ -1804,7 +2008,7 @@ class HarAnalyzer:
                 severity=severity,
                 url=entry.request.url,
                 message=message,
-                duration_ms=entry.time,
+                duration_ms=entry.time if entry.time >= 0 else None,
                 timestamp=entry.started_date_time,
                 details=details,
                 domain=urlparse(entry.request.url).netloc,
@@ -1862,7 +2066,7 @@ class HarAnalyzer:
                         f"Request exceeded {threshold_ms / 1000:g}s threshold "
                         f"({entry.time / 1000:.1f}s; {where})"
                     ),
-                    duration_ms=entry.time,
+                    duration_ms=entry.time if entry.time >= 0 else None,
                     timestamp=entry.started_date_time,
                     details={
                         "method": entry.request.method,
@@ -1912,7 +2116,7 @@ class HarAnalyzer:
                     url=entry.request.url,
                     message=message,
                     timestamp=entry.started_date_time,
-                    duration_ms=entry.time,
+                    duration_ms=entry.time if entry.time >= 0 else None,
                     details=details,
                     domain=urlparse(entry.request.url).netloc,
                 )
@@ -1967,6 +2171,7 @@ class HarAnalyzer:
                     duration_ms=value,
                     timestamp=endpoint.last_seen,
                     details={
+                        "method": endpoint.method,
                         "count": endpoint.timings.count,
                         "p50": endpoint.timings.p50,
                         label: value,
@@ -2041,6 +2246,7 @@ class HarAnalyzer:
 
         next_of: dict[int, HarEntry] = {}
         targeted: set[int] = set()
+        positions = {id(entry): position for position, entry in enumerate(sorted_entries)}
         for entry in sorted_entries:
             if (
                 entry.response.status not in self.REDIRECT_STATUSES
@@ -2052,7 +2258,7 @@ class HarAnalyzer:
                 if (
                     candidate is not entry
                     and id(candidate) not in targeted
-                    and candidate.started_date_time >= entry.started_date_time
+                    and positions[id(candidate)] > positions[id(entry)]
                 ):
                     next_of[id(entry)] = candidate
                     targeted.add(id(candidate))
@@ -2085,6 +2291,11 @@ class HarAnalyzer:
                     is_loop = True
                     break
                 seen_urls.add(current.request.url)
+            if current.response.status in self.REDIRECT_STATUSES and current.response.redirect_url:
+                target = urljoin(current.request.url, current.response.redirect_url).split("#", 1)[
+                    0
+                ]
+                is_loop = is_loop or target in seen_urls
 
             redirect_hops = [e for e in chain if e.response.status in self.REDIRECT_STATUSES]
             all_hops_expected = all(self.is_expected(e) for e in redirect_hops)
@@ -2119,77 +2330,91 @@ class HarAnalyzer:
     # Timeout clusters
     # -------------------------------------------------------------------------
 
-    TIMEOUT_ROUND_STEP_S = 5.0  # timeouts are configured in round values (30s, 60s, 300s)
-
     def _detect_timeout_clusters(self, entries: list[HarEntry]) -> list[TimeoutCluster]:
-        """Find failed requests whose durations bunch at a round value (timeouts).
+        """Find similar failure durations per host and evidence category.
 
-        Only 5xx and status-0 requests are considered. Durations are measured from when
-        the request was sent (total minus browser queueing). A cluster is a run of
-        sorted durations where max <= min * (1 + tolerance) with at least the configured
-        count, whose median sits within the tolerance of a multiple of 5 seconds.
+        Total minus recorded browser queueing still includes DNS, connection setup,
+        upload and download; it is not an upstream execution timer.
         """
+        populations: dict[tuple[str, str], list[HarEntry]] = defaultdict(list)
+        for entry in entries:
+            if entry.time <= 0 or self.is_expected(entry):
+                continue
+            if (
+                entry.response.status != 0
+                and entry.response.status < self.HTTP_STATUS_SERVER_ERROR_MIN
+            ):
+                continue
+            kind = self._timeout_cluster_kind([entry])
+            populations[(urlsplit(entry.request.url).netloc, kind)].append(entry)
         tolerance = self.settings.timeout_cluster_tolerance_pct / 100
-        min_requests = self.settings.timeout_cluster_min_requests
-        failed = sorted(
-            (
-                e
-                for e in entries
-                if e.response.status == 0
-                or self.HTTP_STATUS_SERVER_ERROR_MIN
-                <= e.response.status
-                < self.HTTP_STATUS_ERROR_MAX
+        clusters: list[TimeoutCluster] = []
+        for population in populations.values():
+            failed = sorted(population, key=request_active_ms)
+            start_index = 0
+            while start_index < len(failed):
+                end_index = start_index
+                limit = request_active_ms(failed[start_index]) * (1 + tolerance)
+                while (
+                    end_index + 1 < len(failed)
+                    and request_active_ms(failed[end_index + 1]) <= limit
+                ):
+                    end_index += 1
+                members = failed[start_index : end_index + 1]
+                cluster = self._build_timeout_cluster(
+                    members, tolerance, self.settings.timeout_cluster_min_requests
+                )
+                if cluster:
+                    clusters.append(cluster)
+                    start_index = end_index + 1
+                else:
+                    start_index += 1
+        return sorted(
+            clusters,
+            key=lambda cluster: (
+                -cluster.request_count,
+                cluster.median_ms,
+                tuple(cluster.endpoints),
             ),
-            key=request_active_ms,
         )
 
-        clusters: list[TimeoutCluster] = []
-        start_index = 0
-        while start_index < len(failed):
-            end_index = start_index
-            limit = request_active_ms(failed[start_index]) * (1 + tolerance)
-            while end_index + 1 < len(failed) and request_active_ms(failed[end_index + 1]) <= limit:
-                end_index += 1
-            members = failed[start_index : end_index + 1]
-            cluster = self._build_timeout_cluster(members, tolerance, min_requests)
-            if cluster:
-                clusters.append(cluster)
-                start_index = end_index + 1
-            else:
-                start_index += 1
-        return sorted(clusters, key=lambda c: (-c.request_count, c.median_ms))
-
     def _timeout_cluster_kind(self, members: list[HarEntry]) -> str:
-        """``gateway`` when any member is a 5xx, ``client_cancel`` when all were aborted."""
-        if any(m.response.status >= self.HTTP_STATUS_SERVER_ERROR_MIN for m in members):
+        """Name the observed evidence, without inferring a timeout from any 5xx."""
+        if all(member.response.status == HTTP_STATUS_GATEWAY_TIMEOUT for member in members):
             return "gateway"
-        if all(classify_network_error(m) in INFORMATIONAL_ERROR_CATEGORIES for m in members):
+        if all(
+            classify_network_error(member) in INFORMATIONAL_ERROR_CATEGORIES for member in members
+        ):
             return "client_cancel"
-        return "network"
+        if all(classify_network_error(member) == "timed_out" for member in members):
+            return "network"
+        return "failure"
 
     def _build_timeout_cluster(
         self, members: list[HarEntry], tolerance: float, min_requests: int
     ) -> TimeoutCluster | None:
-        """Return a cluster when members are numerous enough and near a round value."""
+        """Return a cluster when members are numerous enough and have positive durations."""
         if len(members) < min_requests:
             return None
         durations = [request_active_ms(m) for m in members]
         median_ms = statistics.median(durations)
         median_s = median_ms / 1000
-        round_value_s = round(median_s / self.TIMEOUT_ROUND_STEP_S) * self.TIMEOUT_ROUND_STEP_S
-        if round_value_s <= 0 or abs(median_s - round_value_s) > round_value_s * tolerance:
+        if median_ms <= 0:
             return None
+        # Keep the existing field, but report the observed median, not a guessed setting.
+        round_value_s = median_s
 
         status_codes: dict[int, int] = defaultdict(int)
         endpoint_counts: dict[str, int] = defaultdict(int)
         for member in members:
             status_codes[member.response.status] += 1
-            endpoint_counts[self.endpoint_key(member.request.url)] += 1
+            endpoint_counts[f"{member.request.method} {self.endpoint_key(member.request.url)}"] += 1
 
         matching_settings = [
             describe_fact(fact)
             for fact in self.config_facts
-            if (fact_seconds := timeout_fact_seconds(fact)) is not None
+            if timeout_fact_applies_to_response_wait(fact)
+            and (fact_seconds := timeout_fact_seconds(fact)) is not None
             and abs(fact_seconds - median_s) <= fact_seconds * tolerance
         ]
         return TimeoutCluster(
@@ -2209,6 +2434,10 @@ class HarAnalyzer:
 
     def _add_request_context(self, details: dict[str, object], entry: HarEntry) -> None:
         """Add the referer hostname and correlation IDs (log lookup keys) when present."""
+        details["entry_index"] = entry.entry_index
+        details["duration_source"] = entry.duration_source
+        if entry.timing_warnings:
+            details["timing_warnings"] = "; ".join(entry.timing_warnings)
         referer_hostname = self._extract_referer_hostname(entry)
         if referer_hostname:
             details["referer_hostname"] = referer_hostname
@@ -2222,8 +2451,10 @@ class HarAnalyzer:
         """Extract referer hostname from request headers."""
         for header in entry.request.headers:
             if header.name.lower() == "referer":
-                parsed = urlparse(header.value)
-                return parsed.netloc
+                try:
+                    return urlparse(header.value).hostname or ""
+                except ValueError:
+                    return ""
         return ""
 
     def _compute_referer_hostnames(self, entries: list[HarEntry]) -> dict[str, int]:
@@ -2406,8 +2637,8 @@ class HarAnalyzer:
     FAST_ERROR_MS = 1_000
     STATUS_HINTS: dict[int, str] = {  # noqa: RUF012 - read-only lookup table
         500: (
-            "the application failed while handling the request; look for a stack trace "
-            "at this time in the application log"
+            "the responding server encountered an unexpected condition; correlate proxy "
+            "and application logs before identifying the failing tier"
         ),
         502: (
             "a proxy got no valid answer from the backend: the backend restarted or "
@@ -2415,9 +2646,9 @@ class HarAnalyzer:
             "(when the 502 comes after a long wait) the proxy gave up reading the response"
         ),
         503: (
-            "no backend took the request: the proxy could not get a backend connection "
-            "(backend down or its connection limits full) or the backend reported itself "
-            "unavailable"
+            "the responding server was temporarily unable to handle the request; overload, "
+            "maintenance or an unavailable upstream are possibilities; inspect Retry-After "
+            "and correlate proxy and application logs"
         ),
         504: (
             "a proxy stopped waiting for the backend; compare the duration with the "
@@ -2470,8 +2701,6 @@ class HarAnalyzer:
                 content_types[content_type] += 1
             median_active_ms = statistics.median(request_active_ms(m) for m in members)
             hint = self.STATUS_HINTS.get(status, "")
-            if status in (502, 503) and median_active_ms < self.FAST_ERROR_MS:
-                hint += "; answered fast, so the request did not wait on the application"
             origins.append(
                 ErrorOrigin(
                     domain=domain,
@@ -2489,7 +2718,6 @@ class HarAnalyzer:
         return origins
 
     CLOCK_OFFSET_MIN_SAMPLES = 3
-    DATE_HEADER_HALF_RESOLUTION_S = 0.5  # Date has 1 s resolution, truncated
 
     def _clock_offsets(self, measured: list[HarEntry]) -> list[HostClockOffset]:
         """Server clock minus browser clock per host, from ``Date`` response headers.
@@ -2505,7 +2733,7 @@ class HarAnalyzer:
                 continue
             try:
                 server_time = parsedate_to_datetime(date_value)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
             if server_time.tzinfo is None:
                 server_time = server_time.replace(tzinfo=UTC)
@@ -2513,7 +2741,7 @@ class HarAnalyzer:
                 milliseconds=entry.timings.before_response_headers_ms
             )
             samples[urlparse(entry.request.url).netloc].append(
-                (server_time - headers_arrived).total_seconds() + self.DATE_HEADER_HALF_RESOLUTION_S
+                (server_time - headers_arrived).total_seconds()
             )
         return [
             HostClockOffset(
@@ -2584,7 +2812,9 @@ class HarAnalyzer:
         The gap before a request is measured from the latest end time (start + time) of all
         earlier requests, so time spent waiting on a long request is not reported as idle.
         """
-        if len(entries) < self.MIN_ENTRIES_FOR_GAP_ANALYSIS:
+        if len(entries) < self.MIN_ENTRIES_FOR_GAP_ANALYSIS or any(
+            entry.time < 0 for entry in entries
+        ):
             return []
 
         sorted_entries = sorted(entries, key=lambda e: e.started_date_time)
@@ -2711,16 +2941,24 @@ class HarAnalyzer:
         not_modified_count = 0
         browser_cache_hit_count = 0
         network_download_count = 0
+        unknown_cache_count = 0
         missing_cache_control_count = 0
         repeated_downloads: list[dict[str, Any]] = []
 
         for url, url_entries in by_url.items():
-            browser_hits = [e for e in url_entries if self.is_browser_cache_hit(e)]
+            browser_hits = [
+                e
+                for e in url_entries
+                if e.response.status == HTTP_STATUS_OK and self.is_browser_cache_hit(e)
+            ]
             network_200s = [
                 e
                 for e in url_entries
-                if e.response.status == HTTP_STATUS_OK and not self.is_browser_cache_hit(e)
+                if e.response.status == HTTP_STATUS_OK
+                and not self.is_browser_cache_hit(e)
+                and not self.is_cache_source_unknown(e)
             ]
+            unknown_cache_count += sum(self.is_cache_source_unknown(e) for e in url_entries)
             status_304_count = sum(
                 1 for e in url_entries if e.response.status == self.HTTP_STATUS_NOT_MODIFIED
             )
@@ -2752,12 +2990,13 @@ class HarAnalyzer:
             return None
         repeated_downloads.sort(key=lambda x: (-x["total_bytes"], x["url"]))
         served_without_download = not_modified_count + browser_cache_hit_count
-        cacheable_get_count = served_without_download + network_download_count
+        cacheable_get_count = served_without_download + network_download_count + unknown_cache_count
         return CacheAnalysis(
             cacheable_get_count=cacheable_get_count,
             not_modified_count=not_modified_count,
             browser_cache_hit_count=browser_cache_hit_count,
             network_download_count=network_download_count,
+            unknown_cache_count=unknown_cache_count,
             repeated_download_request_count=sum(r["count"] for r in repeated_downloads),
             repeated_downloads=repeated_downloads[:20],
             missing_cache_control_count=missing_cache_control_count,
@@ -2928,7 +3167,7 @@ class HarAnalyzer:
                     ),
                     recommendation=(
                         "Check the backend behind these endpoints first; see the error "
-                        "origin table for which tier answered"
+                        "origin table for header evidence; confirm the tier in server logs"
                     ),
                 )
             )
@@ -2951,54 +3190,41 @@ class HarAnalyzer:
         findings: list[KeyFinding] = []
         for cluster in report.timeout_clusters[: self.FINDING_LIST_LIMIT]:
             statuses = ", ".join(f"{code} x{count}" for code, count in cluster.status_codes.items())
-            span = (
-                f"~{cluster.round_value_s:.1f}s after being sent "
-                f"({cluster.min_ms / 1000:.1f}-{cluster.max_ms / 1000:.1f}s; {statuses})"
-            )
-            if cluster.kind == "client_cancel":
-                findings.append(
-                    KeyFinding(
-                        category="timeout_cluster",
-                        severity=IssueSeverity.MEDIUM,
-                        summary=(
-                            f"{cluster.request_count} requests were cancelled by the "
-                            f"browser {span} — consistent with a client-side timeout or "
-                            f"a polling cancel"
-                        ),
-                        recommendation=(
-                            "The page gave up, not a proxy; check the application's "
-                            "JavaScript request timeout and why no answer came sooner"
-                        ),
-                    )
-                )
-                continue
-            if cluster.matching_settings:
-                recommendation = "Matches configured timeout: " + "; ".join(
-                    cluster.matching_settings
-                )
-            elif report.config_facts_loaded:
-                recommendation = (
-                    "No loaded config setting matches; check load balancer / firewall idle "
-                    "timeouts outside the bundle"
-                )
-            else:
-                recommendation = (
-                    "Compare with httpd ProxyTimeout / BalancerMember timeout=, Tomcat "
-                    "connectionTimeout, load balancer idle timeout (--config-facts matches "
-                    "automatically)"
-                )
-            signature = (
-                "a gateway/proxy timeout" if cluster.kind == "gateway" else "a network timeout"
+            evidence = {
+                "gateway": "504 responses are consistent with a gateway/proxy timeout",
+                "network": "browser timeout errors are consistent with a network timeout",
+                "client_cancel": (
+                    "browser cancellations may reflect a client-side timeout or cancellation"
+                ),
+                "failure": (
+                    "similar failure durations alone do not establish a timeout or failing tier"
+                ),
+            }[cluster.kind]
+            comparison = (
+                "Duration-compatible response-wait settings (scope and timer behavior unverified): "
+                + "; ".join(cluster.matching_settings)
+                if cluster.matching_settings
+                else "No applicable response-wait setting confirmed for these requests."
             )
             findings.append(
                 KeyFinding(
                     category="timeout_cluster",
-                    severity=IssueSeverity.CRITICAL,
+                    severity=IssueSeverity.MEDIUM
+                    if cluster.kind in ("client_cancel", "failure")
+                    else IssueSeverity.HIGH,
                     summary=(
-                        f"{cluster.request_count} failed requests ended {span} — "
-                        f"consistent with {signature}"
+                        f"{cluster.request_count} requests have similar durations "
+                        "excluding recorded "
+                        f"browser queueing: {cluster.min_ms / 1000:.2f}-"
+                        f"{cluster.max_ms / 1000:.2f}s "
+                        f"({statuses}); {evidence}"
                     ),
-                    recommendation=recommendation,
+                    recommendation=(
+                        comparison
+                        + " Correlate request IDs and timestamps with proxy upstream and "
+                        "Tomcat access logs. DNS, connection setup, upload and download remain in "
+                        "these durations; they are not measured application execution time."
+                    ),
                 )
             )
         return findings
@@ -3028,7 +3254,7 @@ class HarAnalyzer:
                     f"{len(ranked)} endpoint(s): {listed}"
                 ),
                 recommendation=(
-                    "See the 5xx error origin table for which tier answered; match the "
+                    "See the 5xx header evidence table; confirm the responding tier and match the "
                     "timestamps against server logs (--export-events)"
                 ),
             )
@@ -3079,12 +3305,19 @@ class HarAnalyzer:
                     category="backend_node",
                     severity=IssueSeverity.HIGH,
                     summary=(
-                        f"All {failures} failures on {domain} came from backend node "
-                        f"{bad.node} ({bad.request_count} requests); the other "
-                        f"{len(nodes) - 1} node(s) served {other_requests} requests "
-                        f"without one"
+                        f"Among requests with routing evidence on {domain}, {failures} failures "
+                        f"were associated with {bad.node} ({bad.request_count} requests); "
+                        f"other route(s) had {other_requests} requests "
+                        "without a 5xx/network failure. "
+                        "Unknown routing evidence: "
+                        f"{report.backend_unknown_request_count} requests, "
+                        f"{report.backend_unknown_failure_count} failures across the capture"
                     ),
-                    recommendation=f"Start with node {bad.node} (named by {bad.source})",
+                    recommendation=(
+                        f"Verify routing to {bad.node} in load balancer and Tomcat access logs "
+                        f"(evidence: {bad.source}); a request cookie indicates intended affinity, "
+                        "not proof of the node that served it. Compare equivalent endpoints."
+                    ),
                 )
             )
         return findings
@@ -3100,14 +3333,15 @@ class HarAnalyzer:
                     category="clock_offset",
                     severity=IssueSeverity.MEDIUM,
                     summary=(
-                        f"Server clock for {offset.domain} is about "
-                        f"{abs(offset.median_seconds):.0f}s {direction} the browser clock "
-                        f"(Date headers, n={offset.sample_count})"
+                        f"Uncertain Date-header difference for {offset.domain}: "
+                        f"{abs(offset.median_seconds):.0f}s {direction} "
+                        "browser header-arrival time "
+                        f"(n={offset.sample_count}); this is not a clock correction"
                     ),
                     recommendation=(
-                        f"Timestamps in this report are browser time; add "
-                        f"{offset.median_seconds:+.0f}s to find the same moment in that "
-                        f"server's logs"
+                        "Keep browser timestamps unchanged. Date can precede response completion "
+                        "or be generated by an intermediary. Verify clock synchronization and "
+                        "correlation IDs before aligning server logs."
                     ),
                 )
             )
@@ -3125,8 +3359,8 @@ class HarAnalyzer:
             is_http1 = str(worst.details.get("http_version", "")).lower().startswith("http/1")
             holders = worst.details.get("in_flight_meanwhile")
             cause = (
-                "HTTP/1.1 allows about six connections per host, so requests queue behind "
-                "slow responses"
+                "Browser connection limits can cause HTTP/1.1 queueing; concurrent requests "
+                "are candidates to investigate, not proven connection holders"
                 if is_http1
                 else "Requests queued in the browser before being sent"
             )
@@ -3170,7 +3404,11 @@ class HarAnalyzer:
                 ),
                 recommendation=(
                     "TTFB covers network round trip, proxies and the application; compare "
-                    "with the host's round-trip estimate, then profile the endpoint"
+                    "with TCP connect observations, then correlate proxy and "
+                    "Tomcat access timings; "
+                    ""
+                    "inspect thread/dependency pools and JVM evidence "
+                    "if server latency is confirmed"
                     if is_slow
                     else f"Below the {self.settings.slow_endpoint_ms:g}ms slow threshold"
                 ),
@@ -3339,6 +3577,8 @@ class HarAnalyzer:
 
     def _bottleneck_findings(self, report: HarAnalysisReport) -> list[KeyFinding]:
         phase_totals = {
+            "Blocked": report.blocked_timings.total_duration_ms,
+            "Send": report.send_timings.total_duration_ms,
             "DNS": report.dns_timings.total_duration_ms,
             "Connect (excl. TLS)": report.connect_timings.total_duration_ms,
             "SSL": report.ssl_timings.total_duration_ms,
@@ -3353,6 +3593,10 @@ class HarAnalyzer:
         if dominant_pct < self.BOTTLENECK_DOMINANCE_PCT:
             return []
         phase_recommendations = {
+            "Blocked": (
+                "Inspect browser queueing and concurrent requests; HAR cannot prove its cause"
+            ),
+            "Send": "Inspect upload size, link speed and server request-body consumption",
             "DNS": "Consider DNS prefetching or switching DNS providers",
             "Connect (excl. TLS)": "Check for connection pooling issues or high network latency",
             "SSL": "Investigate TLS handshake overhead; consider session resumption",
@@ -3370,7 +3614,7 @@ class HarAnalyzer:
         return [
             KeyFinding(
                 category="bottleneck",
-                severity=IssueSeverity.LOW if dominant_phase == "TTFB" else IssueSeverity.HIGH,
+                severity=IssueSeverity.LOW,
                 summary=(
                     f"{'Wait (TTFB)' if dominant_phase == 'TTFB' else dominant_phase} accounts "
                     f"for {dominant_pct:.0f}% of summed phase time"
@@ -3691,9 +3935,10 @@ class OutputFormatter:
         rows = [
             (
                 self._format_timestamp(req.started, timespec="milliseconds"),
-                f"{req.method} {self._extract_path(req.url)}",
+                f"#{req.entry_index} {req.method} "
+                f"{urlsplit(req.url).netloc}{self._extract_path(req.url)}",
                 f"{req.status}" + (f" {req.error_category}" if req.error_category else ""),
-                f"{req.total_ms:.0f}",
+                _ms_or_dash(req.total_ms),
                 _ms_or_dash(req.blocked_ms),
                 _ms_or_dash(req.dns_ms),
                 _ms_or_dash(req.connect_excl_tls_ms),
@@ -3739,14 +3984,14 @@ class OutputFormatter:
                 ReportSection(
                     title="5xx Error Origin (response headers on errors vs successes)",
                     note=(
-                        "Which tier answered: compare the Server header on error responses "
-                        "with the same host's successful responses."
+                        "Compare response headers as clues, not proof of the responding tier. "
+                        "Host-wide successes can include different endpoints and intermediaries."
                     ),
                     headers=(
                         "Host",
                         "Status",
                         "Count",
-                        "Median since sent",
+                        "Median total minus queue",
                         "Server on errors",
                         "Server on successes",
                         "Content-Type on errors",
@@ -3777,7 +4022,10 @@ class OutputFormatter:
             sections.append(
                 ReportSection(
                     title="Backend Nodes",
-                    note="Node names come from the session route cookie or X-Served-By header.",
+                    note=(
+                        "Routing hints from session cookies or X-Served-By; "
+                        "request affinity does not prove the serving node."
+                    ),
                     headers=("Host", "Node", "Source", "Requests", "5xx", "NetErr", "Tail total"),
                     rows=[
                         (
@@ -3801,10 +4049,10 @@ class OutputFormatter:
         if report.clock_offsets:
             sections.append(
                 ReportSection(
-                    title="Clock Offset (server Date header minus browser clock)",
+                    title="Date Header Differences (uncertain; not clock corrections)",
                     note=(
-                        "Report timestamps are browser time. Add the offset to find the same "
-                        "moment in that server's logs (accuracy about ±1s)."
+                        "Date minus browser header-arrival time. Message generation, transit and "
+                        "intermediaries affect this value; do not use it to correct log timestamps."
                     ),
                     headers=("Host", "Offset", "Samples"),
                     rows=[
@@ -3818,8 +4066,8 @@ class OutputFormatter:
                 ReportSection(
                     title="Connections per Host",
                     note=(
-                        "New connection = the request spent time connecting. HTTP/1.1 "
-                        "browsers open up to about six per host; HTTP/2 needs one."
+                        "Positive connect time is evidence of connection setup. Browser limits and "
+                        "multiplexing vary; missing connect timing does not prove reuse."
                     ),
                     headers=(
                         "Host",
@@ -3881,7 +4129,36 @@ class OutputFormatter:
     def _capture_note_lines(self, report: HarAnalysisReport) -> list[str]:
         """What was left out of or assumed about the capture (empty when nothing)."""
         notes = report.load_notes
-        lines: list[str] = []
+        lines: list[str] = [
+            "Scope: observations from this browser capture, not service-wide health or throughput. "
+            "HAR alone cannot establish GC pauses, thread exhaustion or database contention."
+        ]
+        lines.append(self._latency_population_line(report))
+        if report.timing_warning_count:
+            lines.append(
+                f"WARNING: timing quality warnings on {report.timing_warning_count} request(s): "
+                + "; ".join(report.timing_warning_examples)
+            )
+        if report.derived_duration_count or report.unavailable_duration_count:
+            lines.append(
+                f"Total timing: {report.derived_duration_count} derived from phases; "
+                f"{report.unavailable_duration_count} unavailable "
+                "and excluded from duration statistics. "
+                "Capture duration and request rate may be incomplete; "
+                "idle-gap detection is disabled "
+                "when any analyzed duration is unavailable."
+            )
+        lines.append(
+            f"Transfer evidence: {report.transfer_unknown_count} request(s) with unknown bytes; "
+            f"{report.transfer_body_only_count} with body bytes only (headers excluded). "
+            "Best-effort transfer totals are a lower bound when evidence is incomplete."
+        )
+        if report.backend_unknown_request_count:
+            lines.append(
+                "Routing evidence unavailable for "
+                f"{report.backend_unknown_request_count} request(s), "
+                f"including {report.backend_unknown_failure_count} 5xx/network failures."
+            )
         if notes.skipped_entry_count:
             reasons = "; ".join(notes.skipped_entry_reasons)
             lines.append(
@@ -3915,7 +4192,9 @@ class OutputFormatter:
             f"Percentiles cover the {population.measured_count:,} request(s) answered over "
             f"the network; excluded: {population.browser_cache_hit_count:,} browser-cache "
             f"hit(s), {population.aborted_count:,} aborted, "
-            f"{population.network_error_count:,} network error(s)"
+            f"{population.network_error_count:,} network error(s), "
+            f"{population.timing_unavailable_count:,} with unavailable total timing, "
+            f"{population.cache_source_unknown_count:,} with unknown cache/network source"
         )
 
     def _print_frontend_section(self, report: HarAnalysisReport) -> None:
@@ -4160,12 +4439,13 @@ class OutputFormatter:
         "Expected",
         "Aborted",
         "Tail total",
-        "Round trip est.",
+        "TCP connect median",
         "Most time in",
         "Status",
     )
     DOMAIN_HEALTH_NOTE = (
-        "Round trip est. = median TCP connect time of new connections. Most time in: "
+        "TCP connect median is observed setup time, not an application-network baseline. "
+        "Most time in: "
         "wait = time to first byte (round trip + proxies + application), network = DNS + "
         "connect + TLS + receive, client = browser queueing + send."
     )
@@ -4277,7 +4557,7 @@ class OutputFormatter:
             f"- **{issue.message}**",
             f"  - Request: `{method_str}{path}`",
             f"  - Domain: `{issue.domain}`",
-            f"  - Timestamp: `{self._format_timestamp(issue.timestamp)}`",
+            f"  - Timestamp: `{self._format_timestamp(issue.timestamp, timespec='milliseconds')}`",
         ]
         if referer:
             lines.append(f"  - Referer Hostname: `{referer}`")
@@ -4291,9 +4571,7 @@ class OutputFormatter:
         return lines
 
     def _md_top_endpoints(self, report: HarAnalysisReport) -> list[str]:
-        filtered_endpoints = [
-            e for e in report.endpoints if not self._is_static_asset(e.url_pattern)
-        ]
+        filtered_endpoints = report.endpoints
         if not filtered_endpoints:
             return []
         lines = ["## Top 10 Slowest Endpoints (path templates)", ""]
@@ -4308,8 +4586,9 @@ class OutputFormatter:
         lines.append("|-------------------|-------|------------|-----------|----------|----------|")
         for endpoint in filtered_endpoints[:MARKDOWN_TOP_ENDPOINTS]:
             path = urlparse(endpoint.url_pattern).path
+            identity = f"{endpoint.method} {urlsplit(endpoint.url_pattern).netloc}{path}"
             lines.append(
-                f"| `{md_cell(path)}` | {endpoint.count} | {format_tail(endpoint.timings)} | "
+                f"| `{md_cell(identity)}` | {endpoint.count} | {format_tail(endpoint.timings)} | "
                 f"{format_tail(endpoint.ttfb_timings)} | "
                 f"{format_tail(endpoint.network_total_timings)} | "
                 f"**{self._dominant_side(endpoint)}** |"
@@ -4422,7 +4701,7 @@ class OutputFormatter:
             summary_lines.append("")
             rr = report.request_rate_stats
             summary_lines.append(
-                f"**Request Rate:** {rr.overall_requests_per_second:.2f} req/s "
+                f"**Observed browser request rate:** {rr.overall_requests_per_second:.2f} req/s "
                 f"(peak: {rr.peak_requests_per_second:.0f} req/s)"
             )
 
@@ -4518,10 +4797,10 @@ class OutputFormatter:
     OUTAGE_TITLE = f"Outages (no success, {OUTAGE_MIN_FAILURES}+ 5xx/network failures)"
 
     def _outages(self, services: list[ServiceFailureStats]) -> list[ServiceFailureStats]:
-        return [s for s in services if s.is_outage and not self._is_static_path(s.path)]
+        return [s for s in services if s.is_outage]
 
     def _failing_services(self, services: list[ServiceFailureStats]) -> list[ServiceFailureStats]:
-        return [s for s in services if s.problem_count > 0 and not self._is_static_path(s.path)]
+        return [s for s in services if s.problem_count > 0]
 
     def _print_outages(self, services: list[ServiceFailureStats], max_rows: int) -> None:
         outages = self._outages(services)
@@ -4646,13 +4925,15 @@ class OutputFormatter:
                 path = self._extract_path(issue.url)
                 method = issue.details.get("method")
                 method_str = f"{method} " if method else ""
-                ts = self._format_timestamp(issue.timestamp, timespec="seconds")
+                ts = self._format_timestamp(issue.timestamp, timespec="milliseconds")
                 referer = issue.details.get("referer_hostname")
                 referer_str = f" referer={referer}" if referer else ""
                 domain_branch.add(
                     f"[{color}]{rich_escape(issue.message)}[/{color}]: "
                     f"{rich_escape(method_str + path)} "
-                    f"[bold magenta]@ {ts}[/bold magenta][dim]{referer_str}[/dim]"
+                    f"[bold magenta]@ {ts}[/bold magenta][dim]{referer_str}[/dim] "
+                    f"entry={issue.details.get('entry_index', '-')} "
+                    f"{rich_escape(str(issue.details.get('correlation', '')))}"
                 )
 
             if len(domain_issues) > ISSUES_BY_DOMAIN_MAX_ISSUES:
@@ -4666,7 +4947,7 @@ class OutputFormatter:
         console.print(tree)
 
     def _print_top_endpoints(self, report: HarAnalysisReport) -> None:
-        filtered = [e for e in report.endpoints if not self._is_static_asset(e.url_pattern)]
+        filtered = report.endpoints
         if not filtered:
             return
 
@@ -4683,7 +4964,8 @@ class OutputFormatter:
 
         for endpoint in filtered[:MARKDOWN_TOP_ENDPOINTS]:
             table.add_row(
-                urlparse(endpoint.url_pattern).path,
+                f"{endpoint.method} {urlsplit(endpoint.url_pattern).netloc}"
+                f"{urlparse(endpoint.url_pattern).path}",
                 str(endpoint.count),
                 format_tail(endpoint.timings),
                 format_tail(endpoint.ttfb_timings),
@@ -4720,9 +5002,7 @@ class OutputFormatter:
             IssueType.CLIENT_ERROR,
             IssueType.RATE_LIMITED,
         }
-        return [
-            i for i in issues if i.issue_type in error_types and not self._is_static_asset(i.url)
-        ]
+        return [i for i in issues if i.issue_type in error_types]
 
     def _filter_backend_perf_issues(self, issues: list[DetectedIssue]) -> list[DetectedIssue]:
         perf_types = {
@@ -4732,9 +5012,7 @@ class OutputFormatter:
             IssueType.LARGE_PAYLOAD,
             IssueType.REDIRECT_LOOP,
         }
-        return [
-            i for i in issues if i.issue_type in perf_types and not self._is_static_asset(i.url)
-        ]
+        return [i for i in issues if i.issue_type in perf_types]
 
     def _filter_informational_issues(self, issues: list[DetectedIssue]) -> list[DetectedIssue]:
         info_types = {IssueType.REQUEST_ABORTED, IssueType.REDIRECT_CHAIN}
@@ -4792,11 +5070,13 @@ class OutputFormatter:
     @staticmethod
     def _cache_summary_lines(cache: CacheAnalysis) -> list[str]:
         return [
-            f"**Served without a download:** {cache.served_without_download_ratio * 100:.1f}% "
-            f"of {cache.cacheable_get_count:,} GET responses (200 or 304)",
+            f"**Served without a body download:** {cache.served_without_download_ratio * 100:.1f}% "
+            f"of {cache.cacheable_get_count:,} GET responses (200 or 304); "
+            "this is an observed fraction, not a cache eligibility rate",
             f"**Browser Cache Hits (memory/disk):** {cache.browser_cache_hit_count:,}",
             f"**304 Not Modified:** {cache.not_modified_count:,}",
             f"**Downloaded over the network (200):** {cache.network_download_count:,}",
+            f"**Cache/network source unknown (200):** {cache.unknown_cache_count:,}",
             f"**Repeated Network Downloads:** {cache.repeated_download_request_count:,} "
             f"requests across {len(cache.repeated_downloads)} URL(s) fetched more than once "
             f"with no cache hit or 304",
@@ -4836,7 +5116,7 @@ class OutputFormatter:
     # -------------------------------------------------------------------------
 
     TIMEOUT_CLUSTER_HEADERS = (
-        "Ends at (since sent)",
+        "Total minus queue",
         "Kind",
         "Requests",
         "Range",
@@ -4846,34 +5126,34 @@ class OutputFormatter:
         "Config match",
     )
     TIMEOUT_CLUSTER_KINDS = {  # noqa: RUF012 - read-only lookup table
-        "gateway": "gateway/proxy (5xx)",
-        "network": "network (no response)",
+        "gateway": "504 gateway timeout evidence",
+        "failure": "failure duration cluster (cause unknown)",
+        "network": "browser timeout error",
         "client_cancel": "cancelled by browser",
     }
     TIMEOUT_CLUSTER_NOTE = (
-        "Failed (5xx / status 0) requests whose durations bunch at a round value. "
-        "Durations run from when the request was sent, so browser queueing is excluded. "
-        "5xx at a round value is consistent with a gateway, proxy or load-balancer "
-        "timeout; requests cancelled by the browser point at a client-side timeout."
+        "Similar failure durations grouped by host and evidence category. Recorded browser "
+        "queueing is excluded; DNS, setup, upload and download remain. A cluster alone "
+        "does not establish a timeout. Config comparisons do not establish request scope."
     )
 
     def _timeout_cluster_rows(self, report: HarAnalysisReport) -> list[tuple[str, ...]]:
         rows: list[tuple[str, ...]] = []
         for cluster in report.timeout_clusters:
             statuses = ", ".join(f"{code} x{count}" for code, count in cluster.status_codes.items())
-            endpoints = ", ".join(
-                f"{urlparse(url).path} ({count})" for url, count in cluster.endpoints.items()
-            )
+            endpoints = ", ".join(f"{url} ({count})" for url, count in cluster.endpoints.items())
             rows.append(
                 (
-                    f"~{cluster.round_value_s:.1f}s",
+                    f"~{cluster.median_ms / 1000:.2f}s",
                     self.TIMEOUT_CLUSTER_KINDS[cluster.kind],
                     str(cluster.request_count),
                     f"{cluster.min_ms / 1000:.2f}-{cluster.max_ms / 1000:.2f}s",
                     f"{cluster.max_queued_ms / 1000:.1f}s",
                     statuses,
                     endpoints,
-                    "; ".join(cluster.matching_settings) or "-",
+                    "; ".join(cluster.matching_settings) + " (scope unverified)"
+                    if cluster.matching_settings
+                    else "-",
                 )
             )
         return rows
@@ -5309,9 +5589,9 @@ def _template_hash(template: str) -> str:
 def build_events(har: Har, analyzer: HarAnalyzer, source_file: str) -> list[dict[str, Any]]:
     """One event per request, in the shared ``events.jsonl`` format.
 
-    ``level`` is ERROR for 5xx and real network errors, WARN when the request took longer
-    than the slow-endpoint threshold (WebSocket / event-stream connections excepted),
-    otherwise INFO (expected and aborted included).
+    ``level`` is ERROR for unexpected 5xx/network errors and WARN for unexpected 4xx
+    or slow successful requests (long-lived connections excepted). Expected responses
+    and browser cancellations are INFO, matching report classification.
     Paths are templated and carry no query string; only allowlisted correlation headers
     are included.
     """
@@ -5320,13 +5600,11 @@ def build_events(har: Har, analyzer: HarAnalyzer, source_file: str) -> list[dict
         entry_index = entry.entry_index or position
         status = entry.response.status
         category = classify_network_error(entry)
-        real_network_error = category is not None and category not in (
-            INFORMATIONAL_ERROR_CATEGORIES
-        )
-        if real_network_error or (
-            HarAnalyzer.HTTP_STATUS_SERVER_ERROR_MIN <= status < HarAnalyzer.HTTP_STATUS_ERROR_MAX
-        ):
-            level = "ERROR"
+        outcome = analyzer.outcome(entry)
+        if outcome in PROBLEM_OUTCOMES:
+            level = "ERROR" if outcome != RequestOutcome.CLIENT_ERROR else "WARN"
+        elif outcome in (RequestOutcome.EXPECTED, RequestOutcome.ABORTED):
+            level = "INFO"
         elif entry.time > analyzer.settings.slow_endpoint_ms and long_lived_kind(entry) is None:
             level = "WARN"
         else:
@@ -5345,6 +5623,8 @@ def build_events(har: Har, analyzer: HarAnalyzer, source_file: str) -> list[dict
             "status": status,
             "ttfb_ms": entry.timings.wait if entry.timings.wait >= 0 else None,
             "expected": analyzer.is_expected(entry),
+            "duration_source": entry.duration_source,
+            "timing_warnings": entry.timing_warnings,
         }
         if category:
             attrs["error"] = entry.response.error
@@ -5378,7 +5658,7 @@ def build_events(har: Har, analyzer: HarAnalyzer, source_file: str) -> list[dict
                 "stack_signature": None,
                 "template": template,
                 "signature": f"har:{level}:{_template_hash(template)}",
-                "duration_ms": entry.time,
+                "duration_ms": entry.time if entry.time >= 0 else None,
                 "attrs": attrs,
             }
         )
@@ -5435,7 +5715,11 @@ def _brief_lines(
     if backend_findings:
         lines.append("## Findings")
         lines.extend(
-            f"- [{f.severity.value.upper()}] {f.summary}" for f in backend_findings[:row_limit]
+            f"- [{f.severity.value.upper()}] {f.summary} {f.recommendation}"
+            for f in backend_findings[:row_limit]
+        )
+        lines.append(
+            f"Shown {min(row_limit, len(backend_findings))} of {len(backend_findings)} findings."
         )
         lines.append("")
 
@@ -5444,14 +5728,17 @@ def _brief_lines(
         for cluster in report.timeout_clusters[:row_limit]:
             statuses = ", ".join(f"{code}x{count}" for code, count in cluster.status_codes.items())
             if cluster.matching_settings:
-                match = "matches " + "; ".join(cluster.matching_settings)
+                match = "duration-compatible, scope unverified: " + "; ".join(
+                    cluster.matching_settings
+                )
             elif report.config_facts_loaded:
                 match = "no loaded config setting matches"
             else:
                 match = "no config facts loaded"
             kind = OutputFormatter.TIMEOUT_CLUSTER_KINDS[cluster.kind]
             lines.append(
-                f"- {cluster.request_count} req at ~{cluster.round_value_s:.0f}s after send "
+                f"- {cluster.request_count} req at ~{cluster.median_ms / 1000:.2f}s "
+                "excluding queue "
                 f"({cluster.min_ms / 1000:.1f}-{cluster.max_ms / 1000:.1f}s, {statuses}; "
                 f"{kind}): {match}"
             )
@@ -5466,7 +5753,8 @@ def _brief_lines(
         lines.append("| Endpoint | n | TTFB tail | TTFB p50 | Total tail |")
         lines.append("|---|---|---|---|---|")
         lines.extend(
-            f"| {short(urlparse(e.url_pattern).path)} | {e.ttfb_timings.count} | "
+            f"| {md_cell(e.method + ' ' + urlsplit(e.url_pattern).netloc)}"
+            f"{md_cell(short(urlparse(e.url_pattern).path))} | {e.ttfb_timings.count} | "
             f"{tail_value(e.ttfb_timings):.0f} ({tail_label(e.ttfb_timings)}) | "
             f"{e.ttfb_timings.p50:.0f} | {tail_value(e.timings):.0f} |"
             for e in ranked[:row_limit]
@@ -5482,8 +5770,10 @@ def _brief_lines(
         for req in report.slowest_requests[:row_limit]:
             status = f"{req.status}" + (f" {req.error_category}" if req.error_category else "")
             lines.append(
-                f"| {formatter.format_timestamp(req.started)} | {req.method} "
-                f"{short(formatter.extract_path(req.url))} | {status} | {req.total_ms:.0f} | "
+                f"| {formatter.format_timestamp(req.started, timespec=_MS)} | "
+                f"#{req.entry_index} {req.method} "
+                f"{md_cell(urlsplit(req.url).netloc + short(formatter.extract_path(req.url)))} | "
+                f"{status} | {_ms_or_dash(req.total_ms)} | "
                 f"{_ms_or_dash(req.blocked_ms)} | {_ms_or_dash(req.dns_ms)} | "
                 f"{_ms_or_dash(req.connect_excl_tls_ms)} | {_ms_or_dash(req.tls_ms)} | "
                 f"{_ms_or_dash(req.send_ms)} | {_ms_or_dash(req.wait_ms)} | "
@@ -5581,7 +5871,7 @@ _DEFAULT_SETTINGS = AnalyzerSettings()
 
 
 @app.command()
-def analyze(  # noqa: PLR0913 - one parameter per CLI option is how typer works
+def analyze(  # noqa: PLR0913, PLR0917 - Typer requires one parameter per CLI option
     har_file: Path = typer.Argument(  # noqa: B008
         ..., exists=True, file_okay=True, dir_okay=False, readable=True, help="Path to HAR file"
     ),
@@ -5683,20 +5973,20 @@ def analyze(  # noqa: PLR0913 - one parameter per CLI option is how typer works
 
     expected_rules = [] if no_default_expect else list(DEFAULT_EXPECTED_RULES)
     expected_rules.extend(expect or [])
-    settings = AnalyzerSettings(
-        slow_endpoint_ms=slow_ms,
-        duration_exceeded_ms=duration_exceeded_ms,
-        large_payload_bytes=large_payload_bytes,
-        blocking_ms=blocking_ms,
-        idle_gap_ms=gap_ms,
-        large_request_body_bytes=large_request_body_bytes,
-        redirect_chain_min_hops=redirect_chain_min_hops,
-        timeout_cluster_min_requests=timeout_cluster_min,
-        timeout_cluster_tolerance_pct=timeout_tolerance_pct,
-        expected_rules=expected_rules,
-        path_rules=list(path_rule or []),
-    )
     try:
+        settings = AnalyzerSettings(
+            slow_endpoint_ms=slow_ms,
+            duration_exceeded_ms=duration_exceeded_ms,
+            large_payload_bytes=large_payload_bytes,
+            blocking_ms=blocking_ms,
+            idle_gap_ms=gap_ms,
+            large_request_body_bytes=large_request_body_bytes,
+            redirect_chain_min_hops=redirect_chain_min_hops,
+            timeout_cluster_min_requests=timeout_cluster_min,
+            timeout_cluster_tolerance_pct=timeout_tolerance_pct,
+            expected_rules=expected_rules,
+            path_rules=list(path_rule or []),
+        )
         analyzer = HarAnalyzer(
             settings,
             config_facts=load_config_facts(config_facts) if config_facts else None,

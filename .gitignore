@@ -1,7 +1,6 @@
-.python-version
 uv.lock
+.python-version
 test-har/
-tests/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -3,7 +3,7 @@ name = "har-analyze"
 version = "0.1.0"
 description = "HAR file analyzer with deterministic performance insights"
 readme = "README.md"
-requires-python = ">=3.15,<3.16"
+requires-python = ">=3.14,<3.16"
 
 dependencies = [
     "pydantic",
@@ -26,7 +26,7 @@ dev = [
 
 # Ruff configuration
 [tool.ruff]
-target-version = "py315"
+target-version = "py314"
 line-length = 100
 
 [tool.ruff.lint]
@@ -51,7 +51,7 @@ reportUnknownMemberType = "error"
 reportUnknownVariableType = "error"
 reportMissingTypeArgument = "error"
 reportUnnecessaryTypeIgnoreComment = "error"
-pythonVersion = "3.15"
+pythonVersion = "3.14"
 pythonPlatform = "All"
 include = ["src"]
 exclude = ["**/__pycache__", "**/.venv"]

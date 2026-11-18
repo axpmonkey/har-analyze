@@ -651,7 +651,7 @@ NETWORK_ERROR_HINTS: dict[str, str] = {
         "the server's response headers (CORP/COEP/X-Frame-Options) made the browser discard it"
     ),
     "generic_failure": "unspecific browser failure (often a CORS rejection; see the console)",
-    "no_response": "no status and no error text were recorded",
+    "no_response": "no HTTP response or error reason was recorded; cause unknown",
     "other": "an error this tool does not classify",
 }
 
@@ -736,11 +736,11 @@ def parse_server_timings(headers: list[HarHeader]) -> dict[str, float]:
 
 
 _JSESSIONID_ROUTE_RE = re.compile(
-    r"JSESSIONID=[^;,\s.]+\.([A-Za-z0-9_.-]{1,64})(?=[;,\s]|$)", re.IGNORECASE
+    r"(?:^|[;,\s])JSESSIONID=[^;,\s.]+\.([A-Za-z0-9_.-]{1,64})(?=[;,\s]|$)"
 )
-_ROUTEID_RE = re.compile(r"ROUTEID=\.?([A-Za-z0-9_.-]{1,64})(?=[;,\s]|$)", re.IGNORECASE)
-_JSESSIONID_SET_RE = re.compile(r"(?:^|\n)\s*JSESSIONID=([^;,\s]*)([^\n]*)", re.IGNORECASE)
-_COOKIE_PATH_RE = re.compile(r";\s*path=([^;,\s]+)", re.IGNORECASE)
+_ROUTEID_RE = re.compile(r"(?:^|[;,\s])ROUTEID=\.?([A-Za-z0-9_.-]{1,64})(?=[;,\s]|$)")
+_JSESSIONID_SET_RE = re.compile(r"(?:^|\n)\s*JSESSIONID=([^;,\s]*)([^\n]*)")
+_SESSION_ROUTE_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
 _CORRELATION_HEADER_RE = re.compile(
     r"^(x-[a-z0-9-]*(request|correlation|trace)-?id|traceparent|request-id|x-amzn-trace-id)$"
@@ -749,11 +749,25 @@ _CORRELATION_HEADER_RE = re.compile(
 
 def correlation_headers(entry: HarEntry) -> dict[str, str]:
     """Return allowlisted correlation-ID headers from the request and response."""
-    found: dict[str, str] = {}
-    for header in [*entry.request.headers, *entry.response.headers]:
-        if _CORRELATION_HEADER_RE.match(header.name.lower()):
-            found[header.name.lower()] = header.value
-    return found
+    request_ids = {
+        header.name.lower(): header.value
+        for header in entry.request.headers
+        if _CORRELATION_HEADER_RE.match(header.name.lower())
+    }
+    response_ids = {
+        header.name.lower(): header.value
+        for header in entry.response.headers
+        if _CORRELATION_HEADER_RE.match(header.name.lower())
+    }
+    return (
+        request_ids
+        | response_ids
+        | {
+            f"request:{name}": value
+            for name, value in request_ids.items()
+            if name in response_ids and response_ids[name] != value
+        }
+    )
 
 
 def entry_end_time(entry: HarEntry) -> datetime:
@@ -776,7 +790,7 @@ def percentile_sorted(sorted_values: list[float], pct: float) -> float:
 
 MIN_SAMPLES_FOR_TAIL_PERCENTILES = 20
 MIN_SAMPLES_FOR_P99 = 100
-OUTAGE_MIN_FAILURES = 3  # fewer failures than this is a one-off, not an outage
+OUTAGE_MIN_FAILURES = 3  # capture-level threshold for repeated endpoint problems
 
 HTTP_STATUS_SWITCHING_PROTOCOLS = 101
 HTTP_STATUS_OK = 200
@@ -841,34 +855,33 @@ def response_uncompressed_bytes(entry: HarEntry) -> int:
     return max(entry.response.body_size, 0)
 
 
-def request_sent_time(entry: HarEntry) -> datetime:
-    """When the browser finished sending the request (browser clock).
-
-    Start + queueing + DNS + connect + send. This is the closest a HAR gets to the time
-    a server-side access log records the request; one-way network latency is not known.
-    """
+def request_sent_time(entry: HarEntry) -> datetime | None:
+    """Estimate browser send completion from available phases and a recorded send."""
     timings = entry.timings
+    if (
+        timings.send < 0
+        or classify_network_error(entry) in PRE_SEND_ERROR_CATEGORIES
+        or HarAnalyzer.is_browser_cache_hit(entry)
+    ):
+        return None
     phases = (timings.blocked, timings.dns, timings.connect, timings.send)
-    return entry.started_date_time + timedelta(
-        milliseconds=sum(phase for phase in phases if phase >= 0)
-    )
+    elapsed_ms = sum(phase for phase in phases if phase >= 0)
+    if entry.time >= 0 and elapsed_ms > entry.time:
+        return None
+    return entry.started_date_time + timedelta(milliseconds=elapsed_ms)
 
 
-def response_headers_time(entry: HarEntry) -> datetime:
-    """When the first response byte arrived (browser clock)."""
-    return entry.started_date_time + timedelta(
-        milliseconds=entry.timings.before_response_headers_ms
-    )
+def response_headers_time(entry: HarEntry) -> datetime | None:
+    """Estimate first byte arrival for requests with an HTTP status and recorded wait."""
+    sent_at = request_sent_time(entry)
+    if sent_at is None or entry.response.status == 0 or entry.timings.wait < 0:
+        return None
+    return sent_at + timedelta(milliseconds=entry.timings.wait)
 
 
-def server_wait_ms(entry: HarEntry) -> float:
-    """Wait for the first byte when recorded, else total minus browser queueing.
-
-    Browser queueing is never the server's time, so it is kept out either way.
-    """
-    if entry.timings.wait >= 0:
-        return entry.timings.wait
-    return request_active_ms(entry)
+PRE_SEND_ERROR_CATEGORIES = frozenset(
+    {"dns", "tls", "connection_refused", "proxy_tunnel", "blocked_by_client"}
+)
 
 
 # -----------------------------------------------------------------------------
@@ -879,14 +892,15 @@ def server_wait_ms(entry: HarEntry) -> float:
 # Tomcat maxHttpHeaderSize 8192 bytes for the request line plus all headers; httpd
 # LimitRequestFieldSize 8190 bytes per header field; nginx large_client_header_buffers
 # 4 x 8k, one field per buffer.
-REQUEST_HEADER_LIMIT_BYTES = 8_190
+REQUEST_HEADER_BLOCK_LIMIT_BYTES = 8_192
+REQUEST_HEADER_FIELD_LIMIT_BYTES = 8_190
 REQUEST_HEADER_NEAR_LIMIT_BYTES = 6_144
 REQUEST_HEADER_LIMIT_NOTE = (
-    "default limits: Tomcat maxHttpHeaderSize 8192 bytes (request line + all headers), "
-    "httpd LimitRequestFieldSize 8190 bytes per field, nginx large_client_header_buffers "
-    "8k per field"
+    "compare with Tomcat maxHttpRequestHeaderSize (8192 bytes by default for the request "
+    "line and headers), httpd LimitRequestFieldSize (8190 bytes per field by default), "
+    "or nginx large_client_header_buffers (one buffer per field)"
 )
-HEADER_SIZE_STATUSES = frozenset({400, 413, 414, 431})
+HEADER_SIZE_STATUSES = frozenset({400, 431})
 
 
 @dataclass(frozen=True)
@@ -898,6 +912,14 @@ class RequestHeaderSize:
     largest_field_bytes: int
     computed: bool  # summed from the recorded headers (``headersSize`` was absent)
 
+    @property
+    def near_default_limit(self) -> bool:
+        """Whether the block or its largest field reaches a common default limit."""
+        return (
+            self.total_bytes >= REQUEST_HEADER_BLOCK_LIMIT_BYTES
+            or self.largest_field_bytes >= REQUEST_HEADER_FIELD_LIMIT_BYTES
+        )
+
     def describe(self) -> str:
         """``9.1 KB (largest field Cookie 9.0 KB; summed from recorded headers)``."""
         text = f"{self.total_bytes / 1024:.1f} KB"
@@ -907,7 +929,7 @@ class RequestHeaderSize:
                 f"largest field {self.largest_field} {self.largest_field_bytes / 1024:.1f} KB"
             )
         if self.computed:
-            parts.append("summed from recorded headers; a sanitized export omits Cookie")
+            parts.append("estimated from the captured request; headers may be omitted")
         return f"{text} ({'; '.join(parts)})" if parts else text
 
 
@@ -924,8 +946,13 @@ def request_header_size(entry: HarEntry) -> RequestHeaderSize | None:
         return RequestHeaderSize(entry.request.headers_size, largest_name, largest_bytes, False)
     if not headers:
         return None
-    request_line_bytes = len(entry.request.method) + len(entry.request.url.encode()) + 12
-    return RequestHeaderSize(summed + request_line_bytes, largest_name, largest_bytes, True)
+    parts = urlsplit(entry.request.url)
+    target = parts.path or "/"
+    if parts.query:
+        target += "?" + parts.query
+    version = entry.request.http_version or "HTTP/1.1"
+    request_line = f"{entry.request.method} {target} {version}\r\n\r\n"
+    return RequestHeaderSize(summed + len(request_line.encode()), largest_name, largest_bytes, True)
 
 
 # -----------------------------------------------------------------------------
@@ -1119,18 +1146,41 @@ def has_cookie_headers(entry: HarEntry) -> bool:
     )
 
 
-def issued_session_cookies(entry: HarEntry) -> list[tuple[str, str]]:
-    """(cookie path, route or "") for each non-empty JSESSIONID the response sets."""
-    issued: list[tuple[str, str]] = []
+def _session_cookie_updates(entry: HarEntry) -> list[tuple[str, str, str]]:
+    """Cookie domain, path and value for each JSESSIONID update, for in-memory comparison."""
+    parts = urlsplit(entry.request.url)
+    hostname = parts.hostname or ""
+    default_path = parts.path.rpartition("/")[0] or "/"
+    updates: list[tuple[str, str, str]] = []
     for value in _header_values(entry.response.headers, "set-cookie"):
         for match in _JSESSIONID_SET_RE.finditer(value):
-            session_id, attributes = match.group(1), match.group(2)
-            if not session_id or "max-age=0" in attributes.lower().replace(" ", ""):
-                continue  # the cookie is being cleared, not issued
-            path_match = _COOKIE_PATH_RE.search(attributes)
-            _, _, route = session_id.partition(".")
-            issued.append((path_match.group(1) if path_match else "/", route))
-    return issued
+            session_id, raw_attributes = match.groups()
+            attributes: dict[str, str] = {}
+            for raw_attribute in raw_attributes.split(";"):
+                name, _, attribute_value = raw_attribute.strip().partition("=")
+                attributes[name.strip().lower()] = attribute_value.strip()
+            domain = attributes.get("domain", "").lower().removeprefix(".") or hostname
+            if domain != hostname and not hostname.endswith("." + domain):
+                continue
+            path = attributes.get("path", "")
+            if not path.startswith("/"):
+                path = default_path
+            max_age = attributes.get("max-age", "")
+            if re.fullmatch(r"-?[0-9]+", max_age):
+                if max_age.startswith("-") or not max_age.strip("0"):
+                    session_id = ""
+            elif expires := attributes.get("expires"):
+                try:
+                    expires_at = parsedate_to_datetime(expires)
+                except ValueError, TypeError, OverflowError:
+                    pass
+                else:
+                    if expires_at.tzinfo is None:
+                        expires_at = expires_at.replace(tzinfo=UTC)
+                    if expires_at <= entry.started_date_time:
+                        session_id = ""
+            updates.append((domain, path, session_id))
+    return updates
 
 
 def tail_label(stats: TimingStatistics) -> str:
@@ -1542,7 +1592,7 @@ class RequestSummary(BaseModel):
     error_category: str | None = None
     correlation: dict[str, str] = Field(default_factory=dict)
     entry_index: int = 0
-    sent_at: datetime | None = None  # browser finished sending: closest to server receipt
+    sent_at: datetime | None = None  # estimated browser send completion
     headers_at: datetime | None = None  # first response byte arrived
     ended_at: datetime | None = None
     server_ip: str = ""
@@ -1552,8 +1602,8 @@ class RequestSummary(BaseModel):
 class TimeoutCluster(BaseModel):
     """Similar failure durations; causes remain hypotheses.
 
-    ``basis`` says what was measured: ``wait`` (time to first byte, closest to a
-    proxy's read timer) or ``total minus queue`` when wait was not recorded.
+    ``basis`` is either recorded browser ``wait`` on a 5xx or browser
+    ``total minus queue`` for the other measurements.
     """
 
     kind: str  # "gateway" (504), "proxy_502", "network", "client_cancel", "failure"
@@ -1599,7 +1649,7 @@ class ErrorOrigin(BaseModel):
     domain: str
     status: int
     count: int
-    median_active_ms: float  # median time since the request was sent
+    median_active_ms: float  # median recorded wait, or -1 if unavailable
     error_servers: dict[str, int]  # Server header value ("(none)" when absent) -> count
     success_servers: dict[str, int]
     error_content_types: dict[str, int]
@@ -1626,9 +1676,9 @@ class HostClockOffset(BaseModel):
 
 
 class SessionEvent(BaseModel):
-    """Evidence that a server-side session was replaced, moved or lost."""
+    """Browser-visible login redirects and session cookie updates."""
 
-    kind: str  # "login_redirect", "route_changed", "reissued"
+    kind: str  # "login_redirect", "route_changed", "reissued", "cookie_refreshed"
     domain: str
     timestamp: datetime
     entry_index: int
@@ -1682,7 +1732,7 @@ class Incident(BaseModel):
     endpoint_success_count: int
     first_failure: datetime  # when the first of them failed (start + duration)
     last_failure: datetime
-    first_sent: datetime  # earliest "request sent" time: where to start in server logs
+    first_sent: datetime | None  # earliest available browser send estimate
     min_wait_ms: float
     max_wait_ms: float
     evidence: list[str] = Field(default_factory=list)
@@ -1694,7 +1744,7 @@ class Incident(BaseModel):
 
 
 class BackendNodeStats(BaseModel):
-    """Requests per backend node (jvmRoute / ROUTEID / X-Served-By)."""
+    """Responses grouped by the X-Served-By value reported in the capture."""
 
     domain: str
     node: str
@@ -2135,13 +2185,13 @@ class HarAnalyzer:
             connect_excl_tls_ms=e.timings.connect_excluding_ssl,
             tls_ms=e.timings.ssl,
             send_ms=e.timings.send,
-            wait_ms=e.timings.wait,
+            wait_ms=e.timings.wait if e.response.status else -1.0,
             receive_ms=e.timings.receive,
             error_category=classify_network_error(e),
             correlation=correlation_headers(e),
             entry_index=e.entry_index,
             sent_at=request_sent_time(e),
-            headers_at=response_headers_time(e) if e.timings.wait >= 0 else None,
+            headers_at=response_headers_time(e),
             ended_at=entry_end_time(e) if e.time >= 0 else None,
             server_ip=e.server_ip_address or "",
             node=node[0] if node else "",
@@ -2152,16 +2202,11 @@ class HarAnalyzer:
     def _log_correlation(self, entries: list[HarEntry]) -> list[RequestSummary]:
         """Requests worth finding in server logs: failures first (oldest first), then slowest.
 
-        Each carries the time the request was sent, which is what a server-side access
-        log line is closest to.
+        Each carries the browser send estimate when available.
         """
         failed = sorted(
-            (
-                e
-                for e in entries
-                if self.outcome(e) in (RequestOutcome.SERVER_ERROR, RequestOutcome.NETWORK_ERROR)
-            ),
-            key=lambda e: (request_sent_time(e), e.entry_index),
+            (e for e in entries if self.is_problem(e)),
+            key=lambda e: (e.started_date_time, e.entry_index),
         )
         chosen = failed[: self.LOG_CORRELATION_LIMIT]
         chosen_ids = {id(e) for e in chosen}
@@ -2175,7 +2220,7 @@ class HarAnalyzer:
             if id(entry) not in chosen_ids:
                 chosen.append(entry)
                 chosen_ids.add(id(entry))
-        chosen.sort(key=lambda e: (request_sent_time(e), e.entry_index))
+        chosen.sort(key=lambda e: (e.started_date_time, e.entry_index))
         return [self._request_summary(e) for e in chosen]
 
     @staticmethod
@@ -2230,9 +2275,12 @@ class HarAnalyzer:
             server_errors = outcomes[RequestOutcome.SERVER_ERROR]
             network_errors = outcomes[RequestOutcome.NETWORK_ERROR]
 
+            confirmed_problems = problems - sum(
+                classify_network_error(entry) == "no_response" for entry in domain_entries
+            )
             if (
-                error_rate >= self.DOMAIN_ERROR_RATE_CRITICAL_PCT
-                and problems >= self.DOMAIN_CRITICAL_MIN_PROBLEMS
+                confirmed_problems / total * 100 >= self.DOMAIN_ERROR_RATE_CRITICAL_PCT
+                and confirmed_problems >= self.DOMAIN_CRITICAL_MIN_PROBLEMS
             ):
                 health = DomainHealth.CRITICAL
             elif (
@@ -2407,9 +2455,10 @@ class HarAnalyzer:
                     },
                     served_wait_timings=self._compute_timing_stats(
                         [
-                            server_wait_ms(r)
+                            r.timings.wait
                             for r in measured
-                            if self.outcome(r) != RequestOutcome.SERVER_ERROR
+                            if r.timings.wait >= 0
+                            and r.response.status < self.HTTP_STATUS_SERVER_ERROR_MIN
                         ]
                     ),
                 )
@@ -2461,7 +2510,7 @@ class HarAnalyzer:
             category = classify_network_error(entry)
             if category is None:
                 continue
-            raw_error = entry.response.error or "no response (status 0, no error recorded)"
+            raw_error = entry.response.error or NETWORK_ERROR_HINTS["no_response"]
             details: dict[str, object] = {
                 "method": entry.request.method,
                 "status": entry.response.status,
@@ -2486,6 +2535,10 @@ class HarAnalyzer:
                     "capture was saved)"
                 )
                 details["may_be_in_flight_at_capture_end"] = True
+            elif category == "no_response":
+                issue_type = IssueType.NETWORK_ERROR
+                severity = IssueSeverity.MEDIUM
+                message = "No HTTP response recorded (status 0; cause unknown)"
             else:
                 issue_type = IssueType.NETWORK_ERROR
                 host_failures = well_known_by_host[urlparse(entry.request.url).netloc]
@@ -2535,8 +2588,7 @@ class HarAnalyzer:
     def _detect_duration_exceeded(self, entries: list[HarEntry]) -> list[DetectedIssue]:
         """Detect requests that exceed the duration threshold.
 
-        CRITICAL when the time went into waiting for the response (or the phase split is
-        unknown); HIGH when it went into another phase, which is named.
+        Name the largest recorded phase when a phase breakdown is available.
         """
         threshold_ms = self.settings.duration_exceeded_ms
         descriptions = dict(self._PHASE_DESCRIPTIONS)
@@ -2548,16 +2600,14 @@ class HarAnalyzer:
                 continue  # reported once, as the failure, with its duration
             dominant = self._dominant_phase(entry)
             if dominant is None:
-                severity = IssueSeverity.CRITICAL
-                where = "phase split not recorded"
+                where = "phase split unavailable"
             else:
                 phase_name, phase_ms = dominant
-                severity = IssueSeverity.CRITICAL if phase_name == "wait" else IssueSeverity.HIGH
-                where = f"mostly {descriptions[phase_name]}: {phase_ms / 1000:.1f}s"
+                where = f"largest recorded phase: {descriptions[phase_name]} {phase_ms / 1000:.1f}s"
             issues.append(
                 DetectedIssue(
                     issue_type=IssueType.DURATION_EXCEEDED,
-                    severity=severity,
+                    severity=IssueSeverity.HIGH,
                     url=entry.request.url,
                     message=(
                         f"Request exceeded {threshold_ms / 1000:g}s threshold "
@@ -2614,18 +2664,18 @@ class HarAnalyzer:
             if fingerprint:
                 details["responder"] = fingerprint.describe()
             header_size = request_header_size(entry)
-            if (
-                status in HEADER_SIZE_STATUSES
-                and header_size
-                and max(header_size.total_bytes, header_size.largest_field_bytes)
-                >= REQUEST_HEADER_LIMIT_BYTES
-            ):
+            if status in HEADER_SIZE_STATUSES and header_size and header_size.near_default_limit:
                 severity = IssueSeverity.HIGH
-                message += " with request headers at or over the common 8 KB limit"
+                message += " with captured header size near or above a common default limit"
                 details["request_headers"] = header_size.describe()
                 details["request_headers_over_limit"] = True
-            if status == HTTP_STATUS_PAYLOAD_TOO_LARGE and entry.request.body_size > 0:
-                details["request_body"] = format_bytes(entry.request.body_size)
+            rejected_body_size = (
+                entry.request.body_size
+                if status == HTTP_STATUS_PAYLOAD_TOO_LARGE and entry.request.body_size > 0
+                else None
+            )
+            if rejected_body_size is not None:
+                details["request_body"] = format_bytes(rejected_body_size)
             if entry.time > self.settings.duration_exceeded_ms:
                 details["over_duration_threshold"] = True
             issues.append(
@@ -2636,6 +2686,7 @@ class HarAnalyzer:
                     message=message,
                     timestamp=entry.started_date_time,
                     duration_ms=entry.time if entry.time >= 0 else None,
+                    size_bytes=rejected_body_size,
                     details=details,
                     domain=urlparse(entry.request.url).netloc,
                 )
@@ -2861,13 +2912,12 @@ class HarAnalyzer:
     def _detect_timeout_clusters(self, entries: list[HarEntry]) -> list[TimeoutCluster]:
         """Find similar failure durations per host and evidence category.
 
-        A 5xx is measured by its wait for the first byte, which is what a proxy's read
-        timer sees; a request with no response is measured by total minus browser
-        queueing (which still includes DNS, connection setup and upload).
+        Prefer recorded browser wait on a 5xx. Otherwise compare total minus recorded
+        queueing, which can include DNS, connection setup, upload and download.
         """
         populations: dict[tuple[str, str, str], list[HarEntry]] = defaultdict(list)
         for entry in entries:
-            if entry.time <= 0 or self.is_expected(entry):
+            if self._cluster_duration_ms(entry) <= 0 or self.is_expected(entry):
                 continue
             if (
                 entry.response.status != 0
@@ -2913,14 +2963,14 @@ class HarAnalyzer:
 
     def _cluster_basis(self, entry: HarEntry) -> str:
         has_wait = entry.response.status >= self.HTTP_STATUS_SERVER_ERROR_MIN and (
-            entry.timings.wait > 0
+            entry.timings.wait >= 0
         )
         return self.CLUSTER_BASIS_WAIT if has_wait else self.CLUSTER_BASIS_ACTIVE
 
     def _cluster_duration_ms(self, entry: HarEntry) -> float:
         if self._cluster_basis(entry) == self.CLUSTER_BASIS_WAIT:
             return entry.timings.wait
-        return request_active_ms(entry)
+        return request_active_ms(entry) if entry.time >= 0 else -1.0
 
     def _timeout_cluster_kind(self, members: list[HarEntry]) -> str:
         """Name the observed evidence, without inferring a timeout from any 5xx."""
@@ -2989,7 +3039,8 @@ class HarAnalyzer:
         """Add the referer hostname and correlation IDs (log lookup keys) when present."""
         details["entry_index"] = entry.entry_index
         details["endpoint"] = self.path_template(entry.request.url)
-        details["sent_at"] = request_sent_time(entry)
+        if (sent_at := request_sent_time(entry)) is not None:
+            details["sent_at"] = sent_at
         if entry.server_ip_address:
             details["server_ip"] = entry.server_ip_address
         details["duration_source"] = entry.duration_source
@@ -3131,9 +3182,8 @@ class HarAnalyzer:
                     and entry.request.body_size > TOMCAT_MAX_POST_SIZE_BYTES
                 ):
                     note = (
-                        "form body over Tomcat's default maxPostSize (2 MiB): Tomcat does "
-                        "not parse the parameters of a larger form body unless the limit "
-                        "is raised"
+                        "form body over Tomcat's default maxPostSize (2 MiB), which "
+                        "applies when the connector parses the body into parameters"
                     )
                 elif entry.response.status == HTTP_STATUS_PAYLOAD_TOO_LARGE:
                     note = (
@@ -3215,20 +3265,14 @@ class HarAnalyzer:
             "and application logs before identifying the failing tier"
         ),
         502: (
-            "a proxy got no valid answer from the backend. Fast: the backend refused or "
-            "reset the connection (restart, crash) or closed an idle keep-alive connection "
-            "the proxy then reused (backend keep-alive timeout shorter than the proxy's "
-            "connection reuse). After a long, consistent wait: the proxy's read timeout "
-            'expired; httpd mod_proxy answers 502 "Error reading from remote server", '
-            "not 504, when ProxyTimeout passes before the response headers arrive"
+            "a gateway reports an invalid or missing upstream response. In httpd "
+            "mod_proxy_http, an upstream status-line read failure can produce 502, "
+            "including on timeout. Check the proxy error log for the actual failure."
         ),
         503: (
-            "the responding server was temporarily unable to handle the request. httpd "
-            "mod_proxy answers 503 without contacting the backend while a worker is in "
-            "error state (retry, default 60 s), so a run of fast 503s after one failure "
-            "fits that. A Tomcat connector that runs out of request threads queues "
-            "connections instead of answering 503, so thread exhaustion shows as rising "
-            "wait times, not as 503s. Inspect Retry-After and correlate proxy logs"
+            "the responding server was temporarily unable to handle the request. Check "
+            "Retry-After, proxy worker state, and application logs. If Tomcat saturation "
+            "is suspected, check executor utilization and connector connection counts."
         ),
         504: (
             "a proxy stopped waiting for the backend; compare the wait with the proxy's "
@@ -3263,7 +3307,7 @@ class HarAnalyzer:
         """For each host and 5xx status, compare response headers with the successes."""
         errors: dict[tuple[str, int], list[HarEntry]] = defaultdict(list)
         host_successes: dict[str, list[HarEntry]] = defaultdict(list)
-        endpoint_successes: dict[tuple[str, str], list[HarEntry]] = defaultdict(list)
+        endpoint_successes: dict[tuple[str, str, str], list[HarEntry]] = defaultdict(list)
         for entry in entries:
             domain = urlparse(entry.request.url).netloc
             outcome = self.outcome(entry)
@@ -3271,7 +3315,9 @@ class HarAnalyzer:
                 errors[(domain, entry.response.status)].append(entry)
             elif outcome == RequestOutcome.SUCCESS and not self.is_browser_cache_hit(entry):
                 host_successes[domain].append(entry)
-                endpoint_successes[(domain, self.path_template(entry.request.url))].append(entry)
+                endpoint_successes[
+                    domain, entry.request.method.upper(), self.path_template(entry.request.url)
+                ].append(entry)
 
         origins: list[ErrorOrigin] = []
         for (domain, status), members in sorted(errors.items()):
@@ -3297,8 +3343,10 @@ class HarAnalyzer:
             # API calls of one host are often answered by different tiers.
             same_endpoint = [
                 success
-                for path in sorted({self.path_template(m.request.url) for m in members})
-                for success in endpoint_successes.get((domain, path), [])
+                for method, path in sorted(
+                    {(m.request.method.upper(), self.path_template(m.request.url)) for m in members}
+                )
+                for success in endpoint_successes.get((domain, method, path), [])
             ]
             compared = same_endpoint or host_successes[domain]
             comparison_scope = (
@@ -3312,10 +3360,11 @@ class HarAnalyzer:
             reading = self._origin_reading(error_servers, success_servers)
             named = ", ".join(f"{name} ({count})" for name, count in sorted(fingerprints.items()))
             if body_fingerprint_count:
-                reading = f"the error page's own text identifies the responder: {named}"
+                reading = f"error-page text or headers suggest these responders: {named}"
             elif fingerprints:
                 reading += f"; headers point at: {named}"
-            median_active_ms = statistics.median(server_wait_ms(m) for m in members)
+            waits = [m.timings.wait for m in members if m.timings.wait >= 0]
+            median_active_ms = statistics.median(waits) if waits else -1.0
             hint = self.STATUS_HINTS.get(status, "")
             origins.append(
                 ErrorOrigin(
@@ -3357,9 +3406,8 @@ class HarAnalyzer:
                 continue
             if server_time.tzinfo is None:
                 server_time = server_time.replace(tzinfo=UTC)
-            headers_arrived = entry.started_date_time + timedelta(
-                milliseconds=entry.timings.before_response_headers_ms
-            )
+            if (headers_arrived := response_headers_time(entry)) is None:
+                continue
             domain = urlparse(entry.request.url).netloc
             samples[domain].append((server_time - headers_arrived).total_seconds())
             date_servers[domain][response_header(entry, "server") or self.NO_HEADER] += 1
@@ -3376,7 +3424,7 @@ class HarAnalyzer:
 
     @staticmethod
     def backend_node(entry: HarEntry) -> tuple[str, str] | None:
-        """Return (node, source) naming the backend that handled the request, if visible.
+        """Return (value, source) for a routing or responder hint, if visible.
 
         Evidence from the response comes first: the route in a ``JSESSIONID`` or
         ``ROUTEID`` the response sets, then ``X-Served-By``. A route in the request's
@@ -3420,16 +3468,23 @@ class HarAnalyzer:
             len(_routes_in(pattern, cookies)) > 1 for pattern in (_JSESSIONID_ROUTE_RE, _ROUTEID_RE)
         )
 
+    def _responder_hint(self, entry: HarEntry) -> str:
+        """Read a captured response hint only when there is network-response evidence."""
+        if (
+            entry.response.status == 0
+            or self.is_browser_cache_hit(entry)
+            or self.is_cache_source_unknown(entry)
+        ):
+            return ""
+        return (response_header(entry, "x-served-by") or "").strip()
+
     def _backend_nodes(self, entries: list[HarEntry]) -> list[BackendNodeStats]:
-        """Requests, failures and latency per backend node, when nodes are visible."""
+        """Count observed response header values without treating them as Tomcat nodes."""
         by_node: dict[tuple[str, str], list[HarEntry]] = defaultdict(list)
-        sources: dict[tuple[str, str], set[str]] = defaultdict(set)
         for entry in entries:
-            node = self.backend_node(entry)
-            if node:
-                key = (urlparse(entry.request.url).netloc, node[0])
-                by_node[key].append(entry)
-                sources[key].add(node[1])
+            responder = self._responder_hint(entry)
+            if responder:
+                by_node[urlsplit(entry.request.url).netloc, responder].append(entry)
         nodes: list[BackendNodeStats] = []
         for (domain, node_name), members in sorted(by_node.items()):
             outcomes = [self.outcome(m) for m in members]
@@ -3437,7 +3492,7 @@ class HarAnalyzer:
                 BackendNodeStats(
                     domain=domain,
                     node=node_name,
-                    source="; ".join(sorted(sources[domain, node_name])),
+                    source="X-Served-By",
                     request_count=len(members),
                     server_error_count=outcomes.count(RequestOutcome.SERVER_ERROR),
                     network_error_count=outcomes.count(RequestOutcome.NETWORK_ERROR),
@@ -3517,44 +3572,32 @@ class HarAnalyzer:
         return any(marker in path_lower for marker in cls.LOGIN_PATH_MARKERS)
 
     def _session_event(
-        self, kind: str, entry: HarEntry, detail: str, last_end: dict[str, datetime]
+        self,
+        kind: str,
+        entry: HarEntry,
+        detail: str,
+        timestamp: datetime,
+        idle_seconds: float | None = None,
     ) -> SessionEvent:
-        """Build an event; idle time is measured from the host's last finished request."""
-        domain = urlsplit(entry.request.url).netloc
+        """Build an event with its browser timestamp and any measured host gap."""
         return SessionEvent(
             kind=kind,
-            domain=domain,
-            timestamp=entry.started_date_time,
+            domain=urlsplit(entry.request.url).netloc,
+            timestamp=timestamp,
             entry_index=entry.entry_index,
             request=f"{entry.request.method} {self.path_template(entry.request.url)}",
             detail=detail,
-            idle_seconds=(
-                max((entry.started_date_time - last_end[domain]).total_seconds(), 0.0)
-                if domain in last_end
-                else None
-            ),
+            idle_seconds=idle_seconds,
         )
 
     def _session_events(self, entries: list[HarEntry]) -> list[SessionEvent]:
-        """Evidence that a server-side session was lost, moved or replaced.
-
-        * ``login_redirect``: a request outside the login pages was redirected to a
-          login page after the application had already answered successfully.
-        * ``reissued``: the response set a ``JSESSIONID`` for a cookie path that was
-          already given one in this capture (needs cookies in the capture).
-        * ``route_changed``: the session route of an application context changed.
-        """
+        """Detect login redirects and compare observed updates within each cookie scope."""
         events: list[SessionEvent] = []
-        hosts_with_app_success: set[str] = set()
+        first_app_response: dict[str, datetime] = {}
         last_end: dict[str, datetime] = {}
-        issue_counts: dict[tuple[str, str], int] = defaultdict(int)
-        context_routes: dict[tuple[str, str], str] = {}
         for entry in sorted(entries, key=lambda e: (e.started_date_time, e.entry_index)):
             parts = urlsplit(entry.request.url)
             domain, path = parts.netloc, parts.path or "/"
-
-            def event(kind: str, detail: str, *, entry: HarEntry = entry) -> SessionEvent:
-                return self._session_event(kind, entry, detail, last_end)
 
             target = entry.response.redirect_url or response_header(entry, "location") or ""
             if (
@@ -3562,48 +3605,96 @@ class HarAnalyzer:
                 and target
                 and not self._is_login_path(path)
                 and self._is_login_path(urlsplit(urljoin(entry.request.url, target)).path)
-                and domain in hosts_with_app_success
+                and domain in first_app_response
+                and first_app_response[domain] <= entry.started_date_time
+                and not self.is_browser_cache_hit(entry)
             ):
-                events.append(
-                    event("login_redirect", f"answered {entry.response.status} to the login page")
+                gap_seconds = (
+                    max((entry.started_date_time - last_end[domain]).total_seconds(), 0.0)
+                    if domain in last_end
+                    else None
                 )
-
-            for cookie_path, _route in issued_session_cookies(entry):
-                issue_counts[domain, cookie_path] += 1
-                issue_number = issue_counts[domain, cookie_path]
-                if issue_number > 1:
-                    events.append(
-                        event(
-                            "reissued",
-                            f"session cookie for path {cookie_path} issued again "
-                            f"(issue {issue_number} in this capture)",
-                        )
+                events.append(
+                    self._session_event(
+                        "login_redirect",
+                        entry,
+                        f"answered {entry.response.status} to the login page",
+                        entry.started_date_time,
+                        gap_seconds,
                     )
-
-            node = self.backend_node(entry)
-            if node and node[1] != "X-Served-By":
-                context = "/" + path.lstrip("/").split("/", 1)[0]
-                previous_route = context_routes.get((domain, context))
-                if previous_route and previous_route != node[0]:
-                    events.append(
-                        event(
-                            "route_changed",
-                            f"route for {context} changed from {previous_route} to {node[0]} "
-                            f"({node[1]})",
-                        )
-                    )
-                context_routes[domain, context] = node[0]
+                )
 
             if (
                 self.outcome(entry) == RequestOutcome.SUCCESS
                 and HTTP_STATUS_OK <= entry.response.status < HTTP_STATUS_MULTIPLE_CHOICES
                 and not self._is_login_path(path)
                 and not _is_static_path(path)
+                and not self.is_browser_cache_hit(entry)
+                and not self.is_cache_source_unknown(entry)
             ):
-                hosts_with_app_success.add(domain)
+                first_byte_at = response_headers_time(entry)
+                if first_byte_at is not None or entry.time >= 0:
+                    observed_at = first_byte_at or entry_end_time(entry)
+                    first_app_response[domain] = min(
+                        observed_at, first_app_response.get(domain, observed_at)
+                    )
             end = entry_end_time(entry)
             if domain not in last_end or end > last_end[domain]:
                 last_end[domain] = end
+        events.extend(self._session_cookie_events(entries))
+        return sorted(events, key=lambda event: (event.timestamp, event.entry_index))
+
+    def _session_cookie_events(self, entries: list[HarEntry]) -> list[SessionEvent]:
+        """Compare cookie observations in response order because requests can overlap."""
+        observations = [
+            (response_headers_time(entry) or entry_end_time(entry), entry, updates)
+            for entry in entries
+            if entry.response.status
+            and not self.is_browser_cache_hit(entry)
+            and (updates := _session_cookie_updates(entry))
+        ]
+        events: list[SessionEvent] = []
+        session_values: dict[tuple[str, str], str] = {}
+        for timestamp, entry, updates in sorted(
+            observations, key=lambda sample: (sample[0], sample[1].entry_index)
+        ):
+            for cookie_domain, cookie_path, session_value in updates:
+                scope = (cookie_domain, cookie_path)
+                previous = session_values.get(scope)
+                if not session_value:
+                    session_values.pop(scope, None)
+                    continue
+                session_values[scope] = session_value
+                if previous is None:
+                    continue
+                cookie_label = f"session cookie for path {cookie_path}"
+                previous_id, _, previous_route = previous.partition(".")
+                session_id, _, route = session_value.partition(".")
+                if session_id != previous_id:
+                    events.append(
+                        self._session_event(
+                            "reissued", entry, f"{cookie_label} value changed", timestamp
+                        )
+                    )
+                elif session_value == previous:
+                    events.append(
+                        self._session_event(
+                            "cookie_refreshed", entry, f"{cookie_label} was set again", timestamp
+                        )
+                    )
+                if (
+                    previous_route != route
+                    and _SESSION_ROUTE_RE.fullmatch(previous_route)
+                    and _SESSION_ROUTE_RE.fullmatch(route)
+                ):
+                    events.append(
+                        self._session_event(
+                            "route_changed",
+                            entry,
+                            f"{cookie_label} route changed from {previous_route} to {route}",
+                            timestamp,
+                        )
+                    )
         return events
 
     # -------------------------------------------------------------------------
@@ -3621,38 +3712,38 @@ class HarAnalyzer:
     def _stall_events(self, measured: list[HarEntry]) -> list[StallEvent]:
         """Find requests sent at different times whose first bytes arrived together.
 
-        Unrelated endpoints that each wait far longer than the host's median and then
-        all answer within a fraction of a second were not individually slow: something
-        they share stopped and then let go. Requests that started together are left
-        out, because those may simply share one slow dependency.
+        Delayed requests across multiple endpoints whose responses arrive close together
+        are candidates for investigating a shared delay.
         """
-        by_domain: dict[str, list[HarEntry]] = defaultdict(list)
+        by_domain: dict[str, list[tuple[datetime, datetime, HarEntry]]] = defaultdict(list)
         for entry in measured:
-            if entry.timings.wait >= 0:
-                by_domain[urlsplit(entry.request.url).netloc].append(entry)
+            sent_at = request_sent_time(entry)
+            if sent_at is not None and entry.timings.wait >= 0:
+                headers_at = sent_at + timedelta(milliseconds=entry.timings.wait)
+                by_domain[urlsplit(entry.request.url).netloc].append((headers_at, sent_at, entry))
 
         events: list[StallEvent] = []
         window = timedelta(milliseconds=self.STALL_RELEASE_WINDOW_MS)
         for domain, host_entries in sorted(by_domain.items()):
             if len(host_entries) < self.STALL_MIN_HOST_SAMPLES:
                 continue
-            median_wait = statistics.median(e.timings.wait for e in host_entries)
+            median_wait = statistics.median(e.timings.wait for _, _, e in host_entries)
             threshold = max(self.STALL_MIN_WAIT_MS, self.STALL_WAIT_RATIO * median_wait)
             delayed = sorted(
-                (e for e in host_entries if e.timings.wait >= threshold),
-                key=lambda e: (response_headers_time(e), e.entry_index),
+                (sample for sample in host_entries if sample[2].timings.wait >= threshold),
+                key=lambda sample: (sample[0], sample[2].entry_index),
             )
             start_index = 0
             while start_index < len(delayed):
                 end_index = start_index
-                release = response_headers_time(delayed[start_index])
+                release = delayed[start_index][0]
                 while (
-                    end_index + 1 < len(delayed)
-                    and response_headers_time(delayed[end_index + 1]) - release <= window
+                    end_index + 1 < len(delayed) and delayed[end_index + 1][0] - release <= window
                 ):
                     end_index += 1
-                members = delayed[start_index : end_index + 1]
-                sent_times = [request_sent_time(m) for m in members]
+                samples = delayed[start_index : end_index + 1]
+                members = [entry for _, _, entry in samples]
+                sent_times = [sent_at for _, sent_at, _ in samples]
                 sent_spread_ms = (max(sent_times) - min(sent_times)).total_seconds() * 1000
                 endpoints = {(m.request.method, self.path_template(m.request.url)) for m in members}
                 if (
@@ -3666,10 +3757,7 @@ class HarAnalyzer:
                             domain=domain,
                             stall_start=min(sent_times),
                             release_time=release,
-                            release_spread_ms=(
-                                response_headers_time(members[-1]) - release
-                            ).total_seconds()
-                            * 1000,
+                            release_spread_ms=(samples[-1][0] - release).total_seconds() * 1000,
                             request_count=len(members),
                             endpoint_count=len(endpoints),
                             min_wait_ms=min(m.timings.wait for m in members),
@@ -3677,10 +3765,7 @@ class HarAnalyzer:
                             host_median_wait_ms=median_wait,
                             entry_indexes=sorted(m.entry_index for m in members),
                             connection_count=(
-                                len(connections)
-                                if len(connections) == len([m for m in members if m.connection])
-                                or connections
-                                else None
+                                len(connections) if all(m.connection for m in members) else None
                             ),
                             http_versions=sorted(
                                 {m.request.http_version or "unknown" for m in members}
@@ -3778,8 +3863,13 @@ class HarAnalyzer:
         for (domain, method, endpoint), requests in by_endpoint.items():
             outcomes = [self.outcome(r) for r in requests]
             success_count = outcomes.count(RequestOutcome.SUCCESS)
-            hard_failures = outcomes.count(RequestOutcome.SERVER_ERROR) + outcomes.count(
-                RequestOutcome.NETWORK_ERROR
+            hard_failures = sum(
+                outcome == RequestOutcome.SERVER_ERROR
+                or (
+                    outcome == RequestOutcome.NETWORK_ERROR
+                    and classify_network_error(request) != "no_response"
+                )
+                for request, outcome in zip(requests, outcomes, strict=True)
             )
             is_outage = success_count == 0 and hard_failures >= OUTAGE_MIN_FAILURES
             by_signature: dict[str, list[HarEntry]] = defaultdict(list)
@@ -3825,9 +3915,10 @@ class HarAnalyzer:
     @staticmethod
     def _incident_fingerprints(
         members: list[HarEntry],
-    ) -> tuple[dict[str, int], dict[str, int], str]:
-        """(responder -> count, exception -> count, first stack frame) from error bodies."""
+    ) -> tuple[dict[str, int], set[str], dict[str, int], str]:
+        """Summarize fingerprints and keep body evidence separate for log guidance."""
         responders: dict[str, int] = defaultdict(int)
+        body_responders: set[str] = set()
         exceptions: dict[str, int] = defaultdict(int)
         first_frame = ""
         for member in members:
@@ -3838,11 +3929,13 @@ class HarAnalyzer:
                 responder = fingerprint.responder
                 if fingerprint.proxy_reason:
                     responder += f': "{fingerprint.proxy_reason}"'
-                responders[responder] += 1
+                responders[f"{responder} [{fingerprint.source}]"] += 1
+                if fingerprint.source == "body":
+                    body_responders.add(fingerprint.responder)
             if fingerprint.exception:
                 exceptions[fingerprint.root_cause or fingerprint.exception] += 1
                 first_frame = first_frame or fingerprint.first_frame
-        return dict(sorted(responders.items())), dict(sorted(exceptions.items())), first_frame
+        return responders, body_responders, exceptions, first_frame
 
     def _incident_cluster_evidence(
         self, members: list[HarEntry], clusters: list[TimeoutCluster]
@@ -3876,12 +3969,11 @@ class HarAnalyzer:
         if members[0].response.status not in HEADER_SIZE_STATUSES:
             return None
         sizes = [size for m in members if (size := request_header_size(m)) is not None]
-        largest = max(sizes, key=lambda size: size.total_bytes, default=None)
-        if largest and (
-            max(largest.total_bytes, largest.largest_field_bytes) >= REQUEST_HEADER_LIMIT_BYTES
-        ):
-            return largest
-        return None
+        return max(
+            (size for size in sizes if size.near_default_limit),
+            key=lambda size: size.total_bytes,
+            default=None,
+        )
 
     def _incident_severity(
         self, outcome: RequestOutcome, status: int, *, is_outage: bool, headers_over_limit: bool
@@ -3911,7 +4003,7 @@ class HarAnalyzer:
         members = sorted(members, key=lambda m: (entry_end_time(m), m.entry_index))
         outcome = self.outcome(members[0])
         status = members[0].response.status
-        responders, exceptions, first_frame = self._incident_fingerprints(members)
+        responders, body_responders, exceptions, first_frame = self._incident_fingerprints(members)
 
         evidence: list[str] = []
         if responders:
@@ -3948,10 +4040,14 @@ class HarAnalyzer:
                 if f"{name}={value}" not in correlation_ids:
                     correlation_ids.append(f"{name}={value}")
 
-        waits = [server_wait_ms(m) for m in members]
+        waits = [m.timings.wait for m in members if m.response.status and m.timings.wait >= 0]
         return Incident(
-            severity=self._incident_severity(
-                outcome, status, is_outage=is_outage, headers_over_limit=bool(largest_headers)
+            severity=(
+                IssueSeverity.MEDIUM
+                if signature == "no_response"
+                else self._incident_severity(
+                    outcome, status, is_outage=is_outage, headers_over_limit=bool(largest_headers)
+                )
             ),
             domain=domain,
             method=method,
@@ -3963,9 +4059,12 @@ class HarAnalyzer:
             endpoint_success_count=success_count,
             first_failure=entry_end_time(members[0]),
             last_failure=entry_end_time(members[-1]),
-            first_sent=min(request_sent_time(m) for m in members),
-            min_wait_ms=min(waits),
-            max_wait_ms=max(waits),
+            first_sent=min(
+                (sent_at for m in members if (sent_at := request_sent_time(m)) is not None),
+                default=None,
+            ),
+            min_wait_ms=min(waits, default=-1.0),
+            max_wait_ms=max(waits, default=-1.0),
             evidence=evidence,
             entry_indexes=sorted(m.entry_index for m in members)[: self.INCIDENT_SAMPLE_LIMIT],
             correlation_ids=correlation_ids[: self.INCIDENT_CORRELATION_LIMIT],
@@ -3974,16 +4073,20 @@ class HarAnalyzer:
             where_to_look=self._where_to_look(
                 outcome,
                 signature,
-                responders=" ".join(responders).lower(),
+                body_responders=" ".join(sorted(body_responders)).lower(),
                 exception=next(iter(exceptions), ""),
                 first_frame=first_frame,
                 headers_over_limit=bool(largest_headers),
                 has_cluster=bool(cluster_evidence),
-                slow_failure=min(waits) >= self.FAST_ERROR_MS,
+                slow_failure=min(waits, default=-1.0) >= self.FAST_ERROR_MS,
             ),
         )
 
     _NETWORK_WHERE_TO_LOOK: dict[str, str] = {  # noqa: RUF012 - read-only lookup table
+        "no_response": (
+            "The exporter recorded no HTTP response or error reason. Check whether the "
+            "request was pending when the capture ended and review the browser Network panel."
+        ),
         "connection_refused": (
             "Nothing accepted the connection: check that the listener (load balancer, web "
             "server or Tomcat connector) was running and the port open at these times"
@@ -4003,9 +4106,8 @@ class HarAnalyzer:
             "and catalina.out for an exception thrown while the response was being written"
         ),
         "timed_out": (
-            "No answer at the network level: check firewall rules and whether the listener "
-            "was accepting connections (a full Tomcat accept queue, acceptCount / "
-            "maxConnections, makes new connections time out)"
+            "The browser reported a timeout. Use the recorded phases and browser-facing "
+            "logs to distinguish connection setup from waiting for a response."
         ),
         "tls": (
             "Check the certificate chain, host name and TLS protocol settings on the tier "
@@ -4025,10 +4127,8 @@ class HarAnalyzer:
     }
     _STATUS_WHERE_TO_LOOK: dict[int, str] = {  # noqa: RUF012 - read-only lookup table
         400: (
-            "For 400: Tomcat rejects malformed requests (invalid characters in the URL or "
-            "headers, oversized headers) before the application sees them, and logs "
-            '"Error parsing HTTP request header" in catalina.out (the first occurrence '
-            "at INFO, later ones only at DEBUG)"
+            "For 400: check which tier rejected the request. If Tomcat rejected it at "
+            'the connector, look for "Error parsing HTTP request header" in its logs.'
         ),
         401: (
             "For 401: check the authentication service's log for this user and time, and "
@@ -4043,13 +4143,13 @@ class HarAnalyzer:
             "every node, and the proxy's path mapping to it"
         ),
         413: (
-            "For 413: compare the request body size with the proxy's limit (nginx "
-            "client_max_body_size, default 1m; httpd LimitRequestBody)"
+            "For 413: identify the tier that rejected the body, then compare the request "
+            "with its effective upload limit."
         ),
         429: "For 429: find which tier applies the rate limit and what it is keyed on",
         500: (
-            "For 500: the stack trace is normally in the application log or catalina.out "
-            "at these times"
+            "For 500: correlate the proxy and application logs for the request. If the "
+            "application produced the error, look for an exception at that time."
         ),
         502: (
             "For 502: check whether the backend JVM restarted or was unreachable at these "
@@ -4063,8 +4163,8 @@ class HarAnalyzer:
             "and started"
         ),
         504: (
-            "For 504: take thread dumps of the JVM while a request is waiting to see what "
-            "it is blocked on, and compare the wait with the proxy's read timeout"
+            "For 504: check which gateway timed out and whether it connected to its upstream. "
+            "Correlate the gateway's error and timing with the next tier."
         ),
     }
 
@@ -4073,7 +4173,7 @@ class HarAnalyzer:
         outcome: RequestOutcome,
         signature: str,
         *,
-        responders: str,
+        body_responders: str,
         exception: str,
         first_frame: str,
         headers_over_limit: bool,
@@ -4088,30 +4188,20 @@ class HarAnalyzer:
                 f"Search the application log and catalina.out for {exception}{where} in the "
                 "window above"
             )
-        if any(name in responders for name in ("tomcat", "spring boot", "java application")):
+        if any(name in body_responders for name in ("tomcat", "spring boot", "java application")):
             tips.append(
-                "The error was written inside the Java tier, so the request reached Tomcat: "
-                "find it in the Tomcat access log by path, status and time"
+                "The captured body resembles a Java-tier error page. Confirm the responder "
+                "by matching the request in the proxy and application access logs."
             )
-        if "httpd" in responders:
+        if "httpd" in body_responders:
             tips.append(
-                "The error page was written by Apache httpd, so Tomcat did not produce this "
-                "response: read httpd's error_log at these times (AH01102 \"error reading "
-                'status line from remote server" is a backend read failure or timeout), '
-                "then check in the Tomcat access log whether the request arrived and when "
-                "it finished"
+                "The body resembles an Apache httpd error page. Check httpd's error log "
+                "for an upstream failure, then check the Tomcat access log for the request."
             )
-        if "nginx" in responders:
+        if "nginx" in body_responders:
             tips.append(
-                "The error page was written by nginx: read nginx's error.log for the "
-                "upstream error at these times, then the Tomcat access log for the same "
-                "requests"
-            )
-        if "aws load balancer" in responders:
-            tips.append(
-                "The response came from the AWS load balancer: its access log records the "
-                "target status and target processing time per request; then check target "
-                "health and the tier behind it"
+                "The body resembles an nginx error page. Check the nginx error log "
+                "and upstream status, then correlate with the application access log."
             )
         if outcome == RequestOutcome.NETWORK_ERROR:
             tips.append(
@@ -4122,19 +4212,15 @@ class HarAnalyzer:
                 )
             )
             return tips
-        if outcome == RequestOutcome.SERVER_ERROR and not responders:
+        if outcome == RequestOutcome.SERVER_ERROR and not body_responders:
             tips.append(
-                "The capture does not show which tier wrote this response (no error body or "
-                "identifying header). Start at the outermost tier's access log (load "
-                "balancer or web server) for these timestamps and work inward: a tier that "
-                "logged an upstream error did not produce it itself"
+                "Start at the browser-facing load balancer or proxy. Compare the status "
+                "it sent to the browser with its upstream status, then follow the request inward."
             )
         if headers_over_limit:
             tips.append(
-                "Request headers are at the usual 8 KB limit: find which cookies are large, "
-                "then reduce them or raise the limit on every tier (Tomcat "
-                "maxHttpHeaderSize, httpd LimitRequestFieldSize, nginx "
-                "large_client_header_buffers)"
+                "Compare the captured header size with the effective limit and protocol "
+                "at the tier that returned the response. Forwarded headers can differ."
             )
         status_tip = self._STATUS_WHERE_TO_LOOK.get(int(signature)) if signature.isdigit() else None
         if signature == "502" and slow_failure:
@@ -4142,17 +4228,15 @@ class HarAnalyzer:
             status_tip = (
                 None
                 if has_cluster
-                else "For a 502 after a long wait: the proxy gave up reading the response "
-                "(httpd answers 502 when ProxyTimeout expires). Compare the wait with the "
-                "proxy's read timeout and take thread dumps while a request is waiting"
+                else "For a delayed 502, check the proxy log for the upstream read error "
+                "and assess which timer, if any, applied to the request."
             )
         if status_tip and not (exception and signature == "500"):
             tips.append(status_tip)
         if has_cluster and signature in ("502", "504"):
             tips.append(
-                "The failures share one duration: if it equals a proxy read timeout, the "
-                "backend sent nothing for that long. Take thread dumps while a request is "
-                "waiting and look at what the request thread is blocked on"
+                "Compare the duration cluster with upstream timing in the proxy log. "
+                "Confirm the timer, failure reason and affected hop before investigating Tomcat."
             )
         return tips
 
@@ -4426,7 +4510,6 @@ class HarAnalyzer:
         "session",
         "header_size",
         "body_limit",
-        "backend_node",
         "domain_health",
         "slowest_server_time",
         "redirect_loop",
@@ -4485,10 +4568,14 @@ class HarAnalyzer:
             findings.append(
                 KeyFinding(
                     category="outage",
-                    severity=IssueSeverity.CRITICAL,
+                    severity=(
+                        IssueSeverity.HIGH
+                        if any(s.status_5xx_count for s in outages)
+                        else IssueSeverity.MEDIUM
+                    ),
                     summary=(
-                        f"{len(outages)} endpoint(s) never succeeded "
-                        f"({OUTAGE_MIN_FAILURES}+ 5xx/network failures each): {listed(outages)}"
+                        f"{len(outages)} endpoint(s) had repeated problems in this capture "
+                        f"with no non-exempt 1xx-3xx outcome: {listed(outages)}"
                     ),
                     recommendation=(
                         "See the Incidents section for the evidence on each and which logs to open"
@@ -4514,18 +4601,13 @@ class HarAnalyzer:
         findings: list[KeyFinding] = []
         for cluster in report.timeout_clusters[: self.FINDING_LIST_LIMIT]:
             statuses = ", ".join(f"{code} x{count}" for code, count in cluster.status_codes.items())
-            read_timeout_evidence = bool(cluster.matching_settings or cluster.proxy_reasons)
+            has_upstream_read_clue = bool(cluster.proxy_reasons)
             evidence = {
                 "gateway": "504 responses are consistent with a gateway/proxy timeout",
                 "proxy_502": (
-                    "502 after one consistent wait is consistent with a proxy read timeout "
-                    "(httpd answers 502, not 504, when ProxyTimeout expires)"
-                    if read_timeout_evidence
-                    else "502 after one consistent wait may be a proxy read timeout (httpd "
-                    "answers 502, not 504, when ProxyTimeout expires); no setting or error "
-                    "page in the capture confirms it"
+                    "502 responses can reflect an upstream read failure, including a timeout"
                 ),
-                "network": "browser timeout errors are consistent with a network timeout",
+                "network": "the browser reported timeouts; the phase and tier may be unknown",
                 "client_cancel": (
                     "browser cancellations may reflect a client-side timeout or cancellation"
                 ),
@@ -4546,22 +4628,21 @@ class HarAnalyzer:
                 else "No configuration facts were loaded to compare with (--config-facts)."
             )
             is_strong = cluster.kind in ("gateway", "network") or (
-                cluster.kind == "proxy_502" and read_timeout_evidence
+                cluster.kind == "proxy_502" and has_upstream_read_clue
             )
             findings.append(
                 KeyFinding(
                     category="timeout_cluster",
                     severity=IssueSeverity.HIGH if is_strong else IssueSeverity.MEDIUM,
                     summary=(
-                        f"{cluster.request_count} failed requests took the same time "
+                        f"{cluster.request_count} requests had similar durations "
                         f"({cluster.basis}): {cluster.min_ms / 1000:.2f}-"
                         f"{cluster.max_ms / 1000:.2f}s ({statuses}); {evidence}"
                     ),
                     recommendation=(
-                        comparison + " Proxy read timers (ProxyTimeout, proxy_read_timeout, mod_jk "
-                        "reply_timeout) measure time without data from the backend, so a "
-                        "match means the backend sent nothing for that long; it does not "
-                        "measure application execution time."
+                        comparison + " Check upstream timing and error logs. Browser wait and "
+                        "elapsed duration have different boundaries from a proxy read timer "
+                        "or a Tomcat Servlet async timeout."
                     ),
                 )
             )
@@ -4601,10 +4682,18 @@ class HarAnalyzer:
     def _network_error_findings(self, report: HarAnalysisReport) -> list[KeyFinding]:
         if not report.network_errors_by_category:
             return []
-        total = sum(report.network_errors_by_category.values())
+        missing = report.network_errors_by_category.get("no_response", 0)
+        total = sum(report.network_errors_by_category.values()) - missing
         by_type = ", ".join(
-            f"{category} ({count})" for category, count in report.network_errors_by_category.items()
+            f"{category} ({count})"
+            for category, count in report.network_errors_by_category.items()
+            if category != "no_response"
         )
+        summary = f"{total} network error(s): {by_type}" if total else ""
+        if missing:
+            summary += ("; " if summary else "") + (
+                f"{missing} request(s) with no HTTP response or recorded error reason"
+            )
         severity_order = {sev: idx for idx, sev in enumerate(IssueSeverity)}
         severity = min(
             (i.severity for i in report.issues if i.issue_type == IssueType.NETWORK_ERROR),
@@ -4618,7 +4707,7 @@ class HarAnalyzer:
             KeyFinding(
                 category="network_errors",
                 severity=severity,
-                summary=f"{total} network error(s): {by_type}",
+                summary=summary,
                 recommendation=f"Consistent with — {hints}",
             )
         ]
@@ -4645,8 +4734,8 @@ class HarAnalyzer:
                         f"{stall.host_median_wait_ms:.0f}ms)"
                     ),
                     recommendation=(
-                        "Requests that start at different times and are answered together "
-                        "were held by something they share. Consistent with a JVM-wide pause "
+                        "Responses arriving together suggest a shared delay. Possible causes "
+                        "include a JVM-wide pause "
                         "(garbage collection or another safepoint), a shared lock or "
                         "exhausted pool that released, or a stalled proxy. Check the GC log "
                         "and thread dumps for the window in the Host-wide Stalls table; the "
@@ -4676,7 +4765,7 @@ class HarAnalyzer:
         if redirects:
             first = redirects[0]
             idle = (
-                f" after {first.idle_seconds:.0f}s without a request to the host"
+                f" after a {first.idle_seconds:.0f}s gap between captured host requests"
                 if first.idle_seconds is not None
                 else ""
             )
@@ -4687,34 +4776,36 @@ class HarAnalyzer:
                     timeout_note = (
                         f" The idle time is {relation} than {description} "
                         f"({seconds / 60:g} min)"
-                        + (
-                            ", so an ordinary session timeout fits."
-                            if relation == "longer"
-                            else ", so a session timeout does not explain it."
-                        )
+                        + ". Verify that this setting applies and check the session's "
+                        "actual last activity in server logs."
                     )
                     break
-            lost_writes = sum(1 for e in redirects if not e.request.startswith(("GET ", "HEAD ")))
+            writes = sum(
+                e.request.split(" ", 1)[0].upper() in {"POST", "PUT", "PATCH", "DELETE"}
+                for e in redirects
+            )
             findings.append(
                 KeyFinding(
                     category="session",
-                    severity=IssueSeverity.HIGH if lost_writes else IssueSeverity.MEDIUM,
+                    severity=IssueSeverity.HIGH if writes else IssueSeverity.MEDIUM,
                     summary=(
                         f"{len(redirects)} request(s) were redirected to the login page after "
                         f"the application had been answering (first: {first.request} on "
                         f"{first.domain}, entry {first.entry_index}{idle})"
                         + (
-                            f"; {lost_writes} were not GET, so their data was not processed"
-                            if lost_writes
+                            f"; {writes} possible write(s) with operation outcome unknown"
+                            if writes
                             else ""
                         )
                     ),
                     recommendation=(
-                        "Consistent with the server-side session having expired or been "
-                        "lost." + timeout_note + " If the idle time is short, check for a "
-                        "failover to a node without the session (no session replication), "
-                        "a restart, and whether the session cookie was sent (cookie Path, "
-                        "Secure and SameSite attributes)."
+                        (
+                            "Verify application logs or transaction state before retrying. "
+                            if writes
+                            else ""
+                        )
+                        + "Check the authentication decision and cookie scope. Session expiry "
+                        "or failover are possible explanations." + timeout_note
                     ),
                 )
             )
@@ -4731,32 +4822,29 @@ class HarAnalyzer:
                         f"{first.detail} on {first.domain}, entry {first.entry_index})"
                     ),
                     recommendation=(
-                        "Consistent with a failover or lost stickiness on the load balancer. "
-                        "Unless sessions are replicated, the new node has no session for the "
-                        "user: check balancer member state and the old node's logs at that "
-                        "time."
+                        "Check balancer routing and session continuity in server logs. "
+                        "A changed route can accompany failover, reassignment, or a new session."
                     ),
                 )
             )
 
         reissued_paths: dict[tuple[str, str], int] = defaultdict(int)
         for event in by_kind["reissued"]:
-            reissued_paths[event.domain, event.detail.split(" issued again")[0]] += 1
+            reissued_paths[event.domain, event.detail.removesuffix(" value changed")] += 1
         repeated = {key: count for key, count in reissued_paths.items() if count >= 2}  # noqa: PLR2004
         if repeated:
             listed = ", ".join(
-                f"{detail} on {domain} ({count + 1} times)"
+                f"{detail} on {domain} ({count} changes)"
                 for (domain, detail), count in sorted(repeated.items())
             )
             findings.append(
                 KeyFinding(
                     category="session",
                     severity=IssueSeverity.MEDIUM,
-                    summary=f"A new session ID was issued repeatedly: {listed}",
+                    summary=f"A session cookie ID changed repeatedly: {listed}",
                     recommendation=(
-                        "One re-issue is normal (Tomcat changes the session ID at login). "
-                        "More than that is consistent with sessions being lost and "
-                        "re-created: see the Session Events table for when."
+                        "Compare the cookie changes with login, logout, and session "
+                        "events in server logs. Authentication can legitimately rotate IDs."
                     ),
                 )
             )
@@ -4774,13 +4862,11 @@ class HarAnalyzer:
                     severity=IssueSeverity.HIGH,
                     summary=(
                         f"{len(over_limit)} request(s) answered {'/'.join(statuses)} carried "
-                        f"request headers at or over 8 KB (largest: "
-                        f"{report.max_request_header_note})"
+                        "headers near or above a common default limit"
                     ),
                     recommendation=(
-                        "Consistent with a request-header size limit: "
-                        f"{REQUEST_HEADER_LIMIT_NOTE}. Find which cookies are large, then "
-                        "reduce them or raise the limit on every tier."
+                        f"Check the tier that returned the error and its logs, then "
+                        f"{REQUEST_HEADER_LIMIT_NOTE}."
                     ),
                 )
             )
@@ -4793,27 +4879,30 @@ class HarAnalyzer:
                         f"Largest request headers in the capture: {report.max_request_header_note}"
                     ),
                     recommendation=(
-                        f"Close to common limits ({REQUEST_HEADER_LIMIT_NOTE}); requests are "
-                        "rejected with 400 or 431 once cookies grow past them."
+                        f"If request headers are being rejected, {REQUEST_HEADER_LIMIT_NOTE}."
                     ),
                 )
             )
 
         rejected = [
-            b for b in report.large_request_bodies if b.status == HTTP_STATUS_PAYLOAD_TOO_LARGE
+            issue
+            for issue in report.issues
+            if issue.details.get("status") == HTTP_STATUS_PAYLOAD_TOO_LARGE
+            and issue.issue_type == IssueType.CLIENT_ERROR
         ]
         if rejected:
+            largest = max((issue.size_bytes or 0 for issue in rejected), default=0)
+            size_note = (
+                f"bodies up to {format_bytes(largest)}" if largest else "body size unavailable"
+            )
             findings.append(
                 KeyFinding(
                     category="body_limit",
                     severity=IssueSeverity.HIGH,
-                    summary=(
-                        f"{len(rejected)} upload(s) were rejected with 413 (bodies up to "
-                        f"{format_bytes(max(b.body_size_bytes for b in rejected))})"
-                    ),
+                    summary=(f"{len(rejected)} upload(s) were rejected with 413 ({size_note})"),
                     recommendation=(
-                        "A tier in front of the application limits request body size: nginx "
-                        "client_max_body_size (default 1m) or httpd LimitRequestBody"
+                        "Identify the tier that returned 413, then check its configured body "
+                        "limit. A proxy, container or application can reject an upload."
                     ),
                 )
             )
@@ -4828,51 +4917,13 @@ class HarAnalyzer:
                     category="body_limit",
                     severity=IssueSeverity.MEDIUM,
                     summary=(
-                        f"{len(oversized_forms)} form post(s) over 2 MiB were answered with an "
-                        "error"
+                        f"{len(oversized_forms)} of the listed large request bodies were "
+                        "forms over 2 MiB that received an error"
                     ),
                     recommendation=(
-                        "Tomcat parses at most maxPostSize (default 2 MiB) of a form body "
-                        "into request parameters, so the application may have received the "
-                        "request without its parameters; raise maxPostSize on the Connector "
-                        "or send the data another way"
-                    ),
-                )
-            )
-        return findings
-
-    def _backend_node_findings(self, report: HarAnalysisReport) -> list[KeyFinding]:
-        """Flag a host where every failure came from one of several backend nodes."""
-        by_domain: dict[str, list[BackendNodeStats]] = defaultdict(list)
-        for node in report.backend_nodes:
-            by_domain[node.domain].append(node)
-        findings: list[KeyFinding] = []
-        for domain, nodes in sorted(by_domain.items()):
-            failing = [n for n in nodes if n.server_error_count + n.network_error_count]
-            if len(nodes) < 2 or len(failing) != 1:  # noqa: PLR2004
-                continue
-            bad = failing[0]
-            failures = bad.server_error_count + bad.network_error_count
-            if failures < OUTAGE_MIN_FAILURES:
-                continue
-            other_requests = sum(n.request_count for n in nodes if n is not bad)
-            findings.append(
-                KeyFinding(
-                    category="backend_node",
-                    severity=IssueSeverity.HIGH,
-                    summary=(
-                        f"Among requests with routing evidence on {domain}, {failures} failures "
-                        f"were associated with {bad.node} ({bad.request_count} requests); "
-                        f"other route(s) had {other_requests} requests "
-                        "without a 5xx/network failure. "
-                        "Unknown routing evidence: "
-                        f"{report.backend_unknown_request_count} requests, "
-                        f"{report.backend_unknown_failure_count} failures across the capture"
-                    ),
-                    recommendation=(
-                        f"Verify routing to {bad.node} in load balancer and Tomcat access logs "
-                        f"(evidence: {bad.source}); a request cookie indicates intended affinity, "
-                        "not proof of the node that served it. Compare equivalent endpoints."
+                        "If Tomcat parsed the form into request parameters, check the effective "
+                        "Connector maxPostSize and the application logs. The HTTP error alone "
+                        "does not identify a parameter parsing failure."
                     ),
                 )
             )
@@ -5068,7 +5119,6 @@ class HarAnalyzer:
             *self._stall_findings(report),
             *self._session_findings(report),
             *self._request_limit_findings(report),
-            *self._backend_node_findings(report),
             *self._slowest_server_time_findings(report),
         ]
 
@@ -5087,10 +5137,11 @@ class HarAnalyzer:
                     category="domain_health",
                     severity=IssueSeverity.CRITICAL,
                     summary=(
-                        f"{len(critical_domains)} domain(s) in critical state: "
+                        f"{len(critical_domains)} domain(s) had a critical problem rate "
+                        "in this capture: "
                         f"{', '.join(critical_domains)}"
                     ),
-                    recommendation="Investigate error rates and backend health for these domains",
+                    recommendation="Review the response and browser error counts for these domains",
                 )
             )
 
@@ -5385,8 +5436,8 @@ def describe_thresholds(settings: AnalyzerSettings) -> list[str]:
         f"large request body > {settings.large_request_body_bytes:,} bytes",
         f"redirect chain ≥ {settings.redirect_chain_min_hops} hops",
         (
-            f"timeout cluster ≥ {settings.timeout_cluster_min_requests} failed requests "
-            f"within ±{settings.timeout_cluster_tolerance_pct:g}%"
+            f"timeout cluster ≥ {settings.timeout_cluster_min_requests} requests with "
+            f"durations within {settings.timeout_cluster_tolerance_pct:g}% of the shortest"
         ),
         f"expected responses: {expected}",
     ]
@@ -5667,6 +5718,8 @@ class OutputFormatter:
     @staticmethod
     def seconds_range(low_ms: float, high_ms: float) -> str:
         """``60.0-60.4s``, or one value when the two round to the same thing."""
+        if low_ms < 0 or high_ms < 0:
+            return "-"
         if abs(high_ms - low_ms) < 50:  # noqa: PLR2004 - below display resolution
             return f"{high_ms / 1000:.1f}s"
         return f"{low_ms / 1000:.1f}-{high_ms / 1000:.1f}s"
@@ -5680,8 +5733,6 @@ class OutputFormatter:
         blocks: list[tuple[str, tuple[str, ...]]] = []
         for number, incident in enumerate(shown, start=1):
             failed = f"{incident.failure_count} of {incident.endpoint_request_count}"
-            if incident.endpoint_success_count == 0:
-                failed += " (none succeeded)"
             request = f"{incident.method} {incident.domain}{incident.endpoint}"
             rows.append(
                 (
@@ -5694,21 +5745,27 @@ class OutputFormatter:
                     self.seconds_range(incident.min_wait_ms, incident.max_wait_ms),
                 )
             )
-            search = (
-                f"Search server logs from "
-                f"{self._format_timestamp(incident.first_sent, timespec='milliseconds')} to "
-                f"{self._format_timestamp(incident.last_failure, timespec='milliseconds')} "
-                f"(browser clock) for {incident.method} {incident.endpoint}"
+            search = "Correlate by request/trace ID when available. "
+            search += (
+                "Browser clock window "
+                f"{self._format_timestamp(incident.first_sent, timespec='milliseconds')}"
+                f" to {self._format_timestamp(incident.last_failure, timespec='milliseconds')}"
+                if incident.first_sent is not None
+                else "Browser send time unavailable; use the observed window above"
             )
+            search += f" for {incident.method} {incident.endpoint}"
             if incident.signature.isdigit():
-                search += f" with status {incident.signature}"
+                search += f" (browser received {incident.signature})"
             keys: list[str] = []
-            if incident.server_ips:
-                keys.append(f"server IP {', '.join(incident.server_ips)}")
-            if incident.nodes:
-                keys.append("node " + ", ".join(f"{n} ({c})" for n, c in incident.nodes.items()))
             if incident.correlation_ids:
                 keys.append("correlation " + ", ".join(incident.correlation_ids))
+            if incident.server_ips:
+                keys.append(f"browser peer IP {', '.join(incident.server_ips)}")
+            if incident.nodes:
+                keys.append(
+                    "routing/responder hints "
+                    + ", ".join(f"{name} ({count})" for name, count in incident.nodes.items())
+                )
             more = incident.failure_count - len(incident.entry_indexes)
             keys.append(
                 "HAR entries "
@@ -5734,8 +5791,8 @@ class OutputFormatter:
             title="Incidents (failed requests grouped by endpoint and signature)",
             note=(
                 "Every failed request is in exactly one row. Signature = HTTP status or "
-                "network error category. Failing between = when the requests failed. "
-                "Wait = time to first byte (total minus browser queueing when not recorded)."
+                "browser error category. Observed window uses request ends when recorded. "
+                "Wait = recorded browser wait for the first byte; - = unavailable."
             ),
             headers=(
                 "#",
@@ -5743,7 +5800,7 @@ class OutputFormatter:
                 "Failed",
                 "Request",
                 "Signature",
-                "Failing between",
+                "Observed window",
                 "Wait",
             ),
             rows=rows,
@@ -5760,7 +5817,7 @@ class OutputFormatter:
             rows.append(
                 (
                     str(req.entry_index),
-                    self._table_time(req.sent_at or req.started),
+                    self._table_time(req.sent_at) if req.sent_at else "-",
                     self._table_time(req.headers_at) if req.headers_at else "-",
                     f"{req.method} {urlsplit(req.url).netloc}{self._extract_path(req.url)}",
                     f"{req.status}" + (f" {req.error_category}" if req.error_category else ""),
@@ -5786,21 +5843,21 @@ class OutputFormatter:
         return ReportSection(
             title="Log Correlation (failed and slowest requests, in time order)",
             note=(
-                "Browser clock. Sent = start + queueing + DNS + connect + send: the closest "
-                "the capture gets to the time a server access log records for the request "
-                "(network transit not included). Wait and Total in ms. Access-log duration "
-                "units differ: httpd %D is microseconds; Tomcat %D is milliseconds up to "
-                "Tomcat 9 and microseconds from Tomcat 10." + offset_note
+                "Use correlation IDs first. Times are browser-side estimates based on "
+                "recorded phases. The browser-facing status can differ from the upstream "
+                "status. Wait and Total in ms. Tomcat can log request begin/end and %F "
+                "for response commit. httpd %D is in microseconds; Tomcat %D is in "
+                "milliseconds through Tomcat 9 and microseconds from Tomcat 10." + offset_note
             ),
             headers=(
                 "Entry",
-                "Sent (≈ server receipt)",
+                "Browser send estimate",
                 "First byte",
                 "Request",
                 "Status",
                 "Wait",
                 "Total",
-                "Server IP / node",
+                "Peer IP / routing hint",
                 "Correlation IDs",
             ),
             rows=rows,
@@ -5847,18 +5904,19 @@ class OutputFormatter:
             kinds = {
                 "login_redirect": "redirected to login",
                 "route_changed": "session route changed",
-                "reissued": "new session ID issued",
+                "reissued": "session cookie ID changed",
+                "cookie_refreshed": "same session cookie set again",
             }
             hidden = len(report.session_events) - SESSION_EVENT_TABLE_MAX_ROWS
             sections.append(
                 ReportSection(
                     title="Session Events",
                     note=(
-                        "A redirect to the login page after the application had answered, a "
-                        "session route that changes, or a session cookie issued again. One "
-                        "re-issue at login is normal. Session IDs are never shown."
+                        "Browser-visible login redirects and session cookie updates. "
+                        "Cookie updates are ordered by estimated response time. Host gap "
+                        "measures time since the previous captured request ended."
                     ),
-                    headers=("Time", "Entry", "Host", "Request", "Event", "Detail", "Idle before"),
+                    headers=("Time", "Entry", "Host", "Request", "Event", "Detail", "Host gap"),
                     rows=[
                         (
                             self._table_time(e.timestamp),
@@ -5990,10 +6048,10 @@ class OutputFormatter:
             )
             sections.append(
                 ReportSection(
-                    title="5xx Error Origin (which tier wrote the error)",
+                    title="5xx Error Origin Clues",
                     note=(
-                        "An error page's own text names the tier that wrote it; headers are "
-                        "weaker clues. Median wait = time to first byte."
+                        "Page fingerprints and headers suggest possible responders. "
+                        "Median wait uses recorded browser wait values."
                     ),
                     headers=(
                         "Host",
@@ -6011,7 +6069,7 @@ class OutputFormatter:
                             o.domain,
                             str(o.status),
                             str(o.count),
-                            f"{o.median_active_ms / 1000:.2f}s",
+                            f"{o.median_active_ms / 1000:.2f}s" if o.median_active_ms >= 0 else "-",
                             self._counts_text(o.fingerprints),
                             self._counts_text(o.error_servers),
                             self._counts_text(o.success_servers),
@@ -6030,13 +6088,12 @@ class OutputFormatter:
         if report.backend_nodes:
             sections.append(
                 ReportSection(
-                    title="Backend Nodes",
+                    title="Response Responder Hints",
                     note=(
-                        "From session cookies or X-Served-By. A route the response sets names "
-                        'the node that answered; "session pinned to" comes from the request '
-                        "cookie and only says where the session was meant to go."
+                        "Counts group responses by X-Served-By. A proxy or cache can set this "
+                        "header. Confirm the serving backend in deployment logs."
                     ),
-                    headers=("Host", "Node", "Source", "Requests", "5xx", "NetErr", "Tail total"),
+                    headers=("Host", "Hint", "Source", "Responses", "5xx", "NetErr", "Tail total"),
                     rows=[
                         (
                             n.domain,
@@ -6132,9 +6189,8 @@ class OutputFormatter:
         lines: list[str] = []
         if not report.backend_nodes:
             lines.append(
-                "Backend node: not available (no JSESSIONID route, ROUTEID cookie or "
-                "X-Served-By header in the capture; Chrome omits cookies unless the HAR is "
-                "exported with sensitive data)"
+                "Responder hints: no usable X-Served-By response header in the capture. "
+                "Cookie routes, when available, indicate affinity."
             )
         if not report.clock_offsets:
             lines.append(
@@ -6190,8 +6246,8 @@ class OutputFormatter:
         if report.backend_ambiguous_request_count:
             lines.append(
                 f"{report.backend_ambiguous_request_count} request(s) carried session cookies "
-                "naming several different routes (one cookie per application path); no node "
-                "was assigned to them."
+                "naming several different routes (one cookie per application path); no routing "
+                "hint was assigned to them."
             )
         if notes.skipped_entry_count:
             reasons = "; ".join(notes.skipped_entry_reasons)
@@ -6401,7 +6457,7 @@ class OutputFormatter:
                 f"{category} {count}"
                 for category, count in report.network_errors_by_category.items()
             )
-            lines.append(f"network errors by type: {by_type}")
+            lines.append(f"browser errors and missing responses: {by_type}")
         return lines
 
     def _md_summary(self, report: HarAnalysisReport) -> list[str]:
@@ -6485,7 +6541,8 @@ class OutputFormatter:
     )
     DOMAIN_HEALTH_TERMINAL_HIDDEN = frozenset({"Expected", "Aborted", "TCP connect median"})
     DOMAIN_HEALTH_NOTE = (
-        "TCP connect median is observed setup time, not an application-network baseline. "
+        "Status describes the captured requests. NetErr includes entries without an HTTP "
+        "response or recorded cause. TCP connect median is observed setup time. "
         "Most time in: "
         "wait = time to first byte (round trip + proxies + application), network = DNS + "
         "connect + TLS + receive, client = browser queueing + send."
@@ -6532,7 +6589,7 @@ class OutputFormatter:
         over_label = f">{report.settings.duration_exceeded_ms / 1000:g}s"
         lines = ["## Backend/API Service Health", ""]
         lines.append(
-            f"| Domain | Method | Path | Req | OK | Expected | Aborted | NetErr | 5xx | 4xx | "
+            f"| Domain | Method | Path | Req | 1xx-3xx | Expected | Aborted | NetErr | 5xx | 4xx | "
             f"{over_label} | ProblemRate | Tail total | Tail wait (TTFB) | Tail net |"
         )
         lines.append(
@@ -6646,7 +6703,7 @@ class OutputFormatter:
             lines.append(f"HAR entries: {entries}")
         sent = [issue.details["sent_at"] for issue in group if "sent_at" in issue.details]
         if sent:
-            lines.append("Sent (≈ server receipt): " + self._time_range(min(sent), max(sent)))
+            lines.append("Browser send estimate: " + self._time_range(min(sent), max(sent)))
         for key, label in self.DETAIL_LABELS.items():
             values: list[str] = []
             for issue in group:
@@ -6945,7 +7002,10 @@ class OutputFormatter:
             )
         self._print_table(table)
 
-    OUTAGE_TITLE = f"Outages (no success, {OUTAGE_MIN_FAILURES}+ 5xx/network failures)"
+    OUTAGE_TITLE = (
+        f"Repeated Endpoint Problems in This Capture "
+        f"(no non-exempt 1xx-3xx, {OUTAGE_MIN_FAILURES}+ 5xx or browser problems)"
+    )
 
     def _outages(self, services: list[ServiceFailureStats]) -> list[ServiceFailureStats]:
         return [s for s in services if s.is_outage]
@@ -6997,7 +7057,7 @@ class OutputFormatter:
         )
         table.add_column("Endpoint", style="cyan", no_wrap=False)
         table.add_column("Req", justify="right")
-        table.add_column("OK", justify="right", style="green")
+        table.add_column("1xx-3xx", justify="right", style="green")
         table.add_column("NetErr", justify="right", style="red")
         table.add_column("5xx", justify="right", style="red")
         table.add_column("4xx", justify="right", style="yellow")
@@ -7269,17 +7329,15 @@ class OutputFormatter:
     )
     TIMEOUT_CLUSTER_KINDS = {  # noqa: RUF012 - read-only lookup table
         "gateway": "504 gateway timeout evidence",
-        "proxy_502": "502 after one consistent wait",
+        "proxy_502": "502 with similar durations",
         "failure": "failure duration cluster (cause unknown)",
         "network": "browser timeout error",
         "client_cancel": "cancelled by browser",
     }
     TIMEOUT_CLUSTER_NOTE = (
-        "Failed requests that took the same time, grouped by host and kind. A 5xx is "
-        "measured by its wait for the first byte (what a proxy's read timer sees); a "
-        "request with no response by total minus browser queueing. Proxy read timers "
-        "measure time without data from the backend, not total request time. A cluster "
-        "alone does not establish a timeout."
+        "Similar durations grouped by host, evidence kind and timing basis. Wait is the "
+        "recorded browser wait for a 5xx response. Total minus recorded queueing can still "
+        "include setup, upload and download. Confirm any timeout with the applicable tier's logs."
     )
 
     def _timeout_cluster_rows(self, report: HarAnalysisReport) -> list[tuple[str, ...]]:
@@ -7318,11 +7376,6 @@ class OutputFormatter:
                 lines.append(
                     "Error pages say: "
                     + ", ".join(f'"{r}" ({c})' for r, c in cluster.proxy_reasons.items())
-                )
-            if cluster.kind == "proxy_502":
-                lines.append(
-                    'httpd mod_proxy answers 502 "Error reading from remote server", not '
-                    "504, when ProxyTimeout expires before the response headers arrive"
                 )
             if lines:
                 blocks.append((f"~{cluster.median_ms / 1000:.2f}s cluster", tuple(lines)))
@@ -7368,8 +7421,9 @@ class OutputFormatter:
         return ReportSection(
             title="Server-Reported Timing vs Wait (TTFB)",
             note=(
-                "From Server-Timing, X-Response-Time and X-Runtime response headers. TTFB "
-                "much larger than the application's own time points at the proxy/network path."
+                "From Server-Timing, X-Response-Time and X-Runtime response headers. The "
+                "metric scope depends on its producer. Compare individual requests and "
+                "verify the measurement boundaries before attributing a difference to any tier."
             ),
             headers=("Endpoint Template", "Metric", "Tail", "p50", "Tail wait (TTFB)"),
             rows=self._server_timing_rows(report),
@@ -7660,6 +7714,22 @@ def _template_hash(template: str) -> str:
     return hashlib.sha1(template.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
 
 
+def _request_event_level(
+    entry: HarEntry, outcome: RequestOutcome, category: str | None, slow_threshold_ms: float
+) -> str:
+    if category == "no_response" or outcome == RequestOutcome.CLIENT_ERROR:
+        return "WARN"
+    if outcome in PROBLEM_OUTCOMES:
+        return "ERROR"
+    if (
+        outcome == RequestOutcome.SUCCESS
+        and entry.timings.wait > slow_threshold_ms
+        and long_lived_kind(entry) is None
+    ):
+        return "WARN"
+    return "INFO"
+
+
 def build_events(har: Har, analyzer: HarAnalyzer, source_file: str) -> list[dict[str, Any]]:
     """One event per request, in the shared ``events.jsonl`` format.
 
@@ -7675,19 +7745,7 @@ def build_events(har: Har, analyzer: HarAnalyzer, source_file: str) -> list[dict
         status = entry.response.status
         category = classify_network_error(entry)
         outcome = analyzer.outcome(entry)
-        if outcome in PROBLEM_OUTCOMES:
-            level = "ERROR" if outcome != RequestOutcome.CLIENT_ERROR else "WARN"
-        elif outcome in (RequestOutcome.EXPECTED, RequestOutcome.ABORTED):
-            level = "INFO"
-        elif (
-            server_wait_ms(entry) > analyzer.settings.slow_endpoint_ms
-            and long_lived_kind(entry) is None
-        ):
-            # Judged on wait for the first byte: time queued in the browser is not the
-            # server's and must not mark a fast response as slow.
-            level = "WARN"
-        else:
-            level = "INFO"
+        level = _request_event_level(entry, outcome, category, analyzer.settings.slow_endpoint_ms)
 
         path_template_value = analyzer.path_template(entry.request.url)
         suffix = f" [{category}]" if category else ""
@@ -7700,7 +7758,9 @@ def build_events(har: Har, analyzer: HarAnalyzer, source_file: str) -> list[dict
             "method": entry.request.method,
             "path_template": path_template_value,
             "status": status,
-            "ttfb_ms": entry.timings.wait if entry.timings.wait >= 0 else None,
+            "ttfb_ms": entry.timings.wait
+            if entry.response.status and entry.timings.wait >= 0
+            else None,
             "expected": analyzer.is_expected(entry),
             "duration_source": entry.duration_source,
             "timing_warnings": entry.timing_warnings,
@@ -7718,10 +7778,10 @@ def build_events(har: Har, analyzer: HarAnalyzer, source_file: str) -> list[dict
         correlation = correlation_headers(entry)
         if correlation:
             attrs["correlation"] = correlation
-        sent_utc = request_sent_time(entry).astimezone(UTC)
-        attrs["sent_ts"] = (
-            sent_utc.strftime("%Y-%m-%dT%H:%M:%S.") + f"{sent_utc.microsecond // 1000:03d}Z"
-        )
+        if (sent_at := request_sent_time(entry)) is not None:
+            attrs["sent_ts"] = (
+                sent_at.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            )
         fingerprint = error_fingerprint(entry)
         if fingerprint and fingerprint.responder:
             attrs["responder"] = fingerprint.responder
@@ -7910,8 +7970,8 @@ def _brief_lines(
     lines.append(
         f"Thresholds: slow wait>{settings.slow_endpoint_ms:g}ms, "
         f"idle gap>{settings.idle_gap_ms:g}ms, "
-        f"timeout cluster≥{settings.timeout_cluster_min_requests}@±"
-        f"{settings.timeout_cluster_tolerance_pct:g}%, expected: "
+        f"timeout cluster≥{settings.timeout_cluster_min_requests}, width "
+        f"{settings.timeout_cluster_tolerance_pct:g}% of shortest, expected: "
         f"{', '.join(settings.expected_rules) or 'none'}"
     )
     return lines
@@ -8146,7 +8206,7 @@ def analyze(  # noqa: PLR0913, PLR0917 - Typer requires one parameter per CLI op
         _DEFAULT_SETTINGS.timeout_cluster_tolerance_pct,
         "--timeout-tolerance-pct",
         min=0.1,
-        help="Timeout cluster width (±%)",
+        help="Maximum cluster width as a percentage of the shortest duration",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
 ) -> None:

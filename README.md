@@ -12,7 +12,7 @@ Java application failures when the capture contains the necessary evidence.
 ## Install and verify
 
 You need [Git](https://git-scm.com/downloads), [uv](https://docs.astral.sh/uv/getting-started/installation/),
-and Python **3.15**. Other Python versions are outside the package's supported range.
+and Python **3.14 or 3.15**.
 
 If uv is not installed, use the command for your operating system from its
 [installation guide](https://docs.astral.sh/uv/getting-started/installation/):
@@ -34,9 +34,11 @@ Open a new terminal after installation, then download and install HAR Analyze:
 ```bash
 git clone https://github.com/axpmonkey/har-analyze.git
 cd har-analyze
-uv sync --python 3.15
+uv sync --python 3.14
 uv run har-analyze version
 ```
+
+Use `uv sync --python 3.15` to install with Python 3.15.
 
 uv creates a `.venv` environment and installs the application and its dependencies.
 It can [download Python when needed](https://docs.astral.sh/uv/concepts/python-versions/#installing-a-python-version).
@@ -116,7 +118,10 @@ uv run har-analyze analyze capture.har --json report.json -o report.md
 
 The JSON document contains report metadata, including `schema_version` and
 `tool_version`, followed by the analysis in `report`. It includes data beyond the
-row limits used in the readable reports.
+row limits used in the readable reports. Missing incident send estimates are
+`null`, and missing wait values in incident ranges and error-origin summaries
+are `-1`. The `backend_nodes` field groups observed `X-Served-By` response
+header values. These values are responder hints and can name an intermediary.
 
 Export one event per accepted request as JSON Lines for correlation with other logs:
 
@@ -127,7 +132,9 @@ uv run har-analyze analyze capture.har --export-events capture.events.jsonl
 Events are sorted by request start time. Each includes a UTC timestamp (`ts`),
 host, severity (`level`), request summary (`message`), duration, and request details
 in `attrs`. Paths are grouped into templates and query strings are omitted.
-`attrs.sent_ts` estimates when the browser finished sending the request.
+`attrs.sent_ts` is a browser-side send estimate included when the recorded
+phases support it. When an ID header has different request and response values,
+the correlation map also includes the request value under `request:<header>`.
 Display timezone options do not change event timestamps.
 
 `--json` and `--export-events` add exports; the usual terminal or Markdown report
@@ -146,9 +153,10 @@ their contents depend on what the HAR file recorded.
 | Summary and Timing Percentiles | Check capture size, duration, response counts, and timing distributions. |
 | Domain Health Overview and Backend/API Service Health | Locate hosts and endpoints with failures or high latency. These describe the captured session. |
 | Timeout Clusters | Find failed requests with similar waits or durations; compare them with configured timeout values. A cluster alone does not prove a timeout. |
-| 5xx Error Origin | Review error-page and header evidence about which tier produced an error. |
-| Host-wide Stalls and Session Events | Investigate responses arriving together, login redirects, session re-issues, or backend route changes. |
-| Timeline and Log Correlation | Locate periods of failure and request timestamps to search in server logs. |
+| 5xx Error Origin Clues | Review page fingerprints and headers for clues about the responder. |
+| Response Responder Hints | Compare captured `X-Served-By` values. Verify which backend handled each request in deployment logs. |
+| Host-wide Stalls and Session Events | Investigate groups of responses arriving together, login redirects, and observed session cookie updates. |
+| Timeline and Log Correlation | Search by request or trace ID first, then by browser time, method, and path. The upstream status and timestamp can differ from those in the capture. |
 | Slowest Individual Requests and Slowest Endpoints | Compare total duration with browser queueing, network phases, and wait time. |
 | Infrastructure and Cache Analysis | Review recorded protocols, connections, server details, and cache behavior. |
 
@@ -160,26 +168,28 @@ their contents depend on what the HAR file recorded.
 | Capture Duration | Elapsed time from the first request's start to the last request's end. |
 | Queued / blocked | Time waiting in the browser before the request can proceed. |
 | DNS / Connect / TLS | Name lookup, TCP connection setup excluding TLS, and TLS negotiation. |
-| Wait / TTFB | Wait for the first response byte after sending the request. This includes the network round trip, proxies, and application processing. |
+| Wait / TTFB | The recorded browser wait for the first response byte. It can include network transit, proxies, and application processing. Missing wait stays unavailable. |
+| Total minus queue | Browser elapsed duration minus recorded blocking time. This can still include DNS, connection setup, upload, and download. |
 | Receive | Time receiving the response, including any time spent waiting for streamed content. |
 | p50 / p95 / p99 | Median, 95th-percentile, and 99th-percentile timing. `n` is the sample count. |
 | Tail | p95 when there are at least 20 samples; otherwise the maximum. |
-| Failure / ProblemRate | Unexpected HTTP 4xx or 5xx responses and network failures. Expected responses and browser cancellations are counted separately. |
+| Failures / ProblemRate | Capture-level outcomes include unexpected 4xx and 5xx responses, browser errors, and entries without an HTTP response. The endpoint problem rate also includes requests that exceeded the duration threshold. Expected responses and browser cancellations have separate outcome counts. |
 
 Timings are in milliseconds unless another unit is shown. Readable reports show
 p95 with at least 20 samples and p99 with at least 100. Latency statistics exclude
 browser-cache hits, network failures, and requests with unavailable timing or
 unknown cache/network source. Capture notes explain these exclusions.
 
-Domain health is **CRITICAL** when at least two requests failed and the failure
-rate is at least 50%. Otherwise it is **DEGRADED** if there is a server or network
-failure, or the failure rate is at least 10%; remaining domains are **HEALTHY**.
-These labels summarize the capture and do not establish service-wide health.
+Domain health is **CRITICAL** when at least two requests have unexpected HTTP
+errors or recorded browser errors and these account for at least 50% of captured
+requests. Entries without a response or recorded error reason can make a domain
+**DEGRADED**, as can a single 5xx, a browser error, or an overall problem rate
+of at least 10%. Other domains are **HEALTHY** in the capture.
 
-For example, repeated 502 responses after roughly 60 seconds suggest checking
-proxy timeout settings and backend logs during those waits. The capture does not
-establish whether the underlying cause was an application delay, a connection
-failure, or another condition. Confirm the cause with server-side evidence.
+Repeated 502 responses around 60 seconds suggest checking upstream timing and
+failure reasons in the proxy log. A same-length configuration value is a clue
+whose applicability depends on the timer and the tier. If a write was redirected
+to login, check application logs or transaction state before retrying.
 
 ### Missing evidence and redaction
 
@@ -229,10 +239,10 @@ uv run har-analyze analyze capture.har --slow-ms 2000 --duration-exceeded-ms 100
 | `--blocking-ms` | `5000` | Browser queueing above this value. |
 | `--gap-ms` | `1000` | Idle period above this value with no request in flight. |
 | `--large-payload-bytes` | `1048576` | Response size above this value (1 MiB). |
-| `--large-request-body-bytes` | `102400` | POST or PUT body size above this value (100 KiB). |
+| `--large-request-body-bytes` | `102400` | Request body size above this value (100 KiB). |
 | `--redirect-chain-min-hops` | `3` | Redirect chain with at least this many hops. |
 | `--timeout-cluster-min` | `3` | Minimum failed requests in a timeout cluster. |
-| `--timeout-tolerance-pct` | `2` | Timeout cluster tolerance, expressed as ± percent. |
+| `--timeout-tolerance-pct` | `2` | Maximum cluster width as a percentage of the shortest duration, also used for config duration comparisons. |
 
 For custom endpoint grouping, use the repeatable `--path-rule "REGEX=NAME"`
 option to replace fully matching path segments with `{NAME}`. Numeric IDs, UUIDs,
@@ -248,7 +258,7 @@ applies to the affected request.
 | Problem | What to check |
 | --- | --- |
 | `uv` or `git` is not found | Install the missing tool, then open a new terminal so PATH changes take effect. |
-| Python cannot be resolved | Confirm Python 3.15 is available for your platform and rerun `uv sync --python 3.15`. Check network access if uv needs to download it. |
+| Python cannot be resolved | Run `uv sync --python 3.14` or `uv sync --python 3.15`. Check network access if uv needs to download the interpreter. |
 | HAR file cannot be opened | Check the path and permissions. Relative paths are resolved from your current directory. |
 | Invalid JSON or HAR structure | Export the Network log again as HAR. Renaming another file to `.har` does not convert it. |
 | A report cannot be written | Check that the destination directory exists and is writable. |

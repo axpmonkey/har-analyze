@@ -29,13 +29,22 @@ from urllib.parse import parse_qsl, urljoin, urlparse, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import typer
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.markup import escape as rich_escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.tree import Tree
+
+from ._jsonstream import JSONStreamError, ObjectBuilder, iter_json_events
 
 HTTP_STATUS_MIN = 100
 HTTP_STATUS_BAD_REQUEST = 400
@@ -102,8 +111,37 @@ class DomainHealth(StrEnum):
 
 
 # =============================================================================
-# HAR Models (HTTP Archive 1.2 spec)
+# HAR Models (HTTP Archive 1.2 spec, plus the producer extensions seen in practice)
 # =============================================================================
+#
+# What each producer writes was established against a ground-truth server (see the
+# README, "How accuracy is verified"). The normalisation below turns those
+# conventions into one model:
+#
+# * Chrome DevTools: failed requests have ``status`` 0 and ``_error``; ``bodySize`` is
+#   negative (``-headersSize``) when nothing was transferred, and -1 on HTTP/2;
+#   ``connection`` holds the server port while ``_connectionId`` is the socket; cache
+#   hits carry ``_fromCache``; service-worker answers carry ``_fetchedViaServiceWorker``;
+#   uploads are recorded with ``bodySize`` 0 and no ``postData``.
+# * Playwright (Chromium, Firefox, WebKit): failed requests have ``status`` -1, ``time``
+#   -1 and ``_failureText``; ``ssl`` is a made-up value on plain HTTP and ``time``
+#   counts the TLS handshake twice on HTTPS (``connect`` already contains it).
+# * mitmproxy: no pages, no ``blocked``/``dns``; ``content.size`` is the encoded size
+#   and ``content.compression`` the bytes saved; errors are free text in ``_error``.
+
+HTTP_STATUS_MAX = 999
+# One name per timing phase, used by every output.
+PHASE_DISPLAY_NAMES = {
+    "Blocked": "Queued",
+    "DNS": "DNS",
+    "Connect (excl. TLS)": "TCP connect",
+    "SSL": "TLS",
+    "Send": "Send",
+    "TTFB": "Wait (TTFB)",
+    "Receive": "Receive",
+}
+CHROME_DEVTOOLS_PRODUCER = "WebInspector"  # log.creator.name of Chrome/Edge DevTools exports
+ERROR_BODY_MAX_CHARS = 65_536
 
 
 class LenientHarModel(BaseModel):
@@ -122,6 +160,13 @@ class LenientHarModel(BaseModel):
         return {key: value for key, value in raw.items() if value is not None}
 
 
+def _size_or_unknown(value: object) -> object:
+    """A size below zero (or not a number) means "not recorded" (-1)."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return -1
+    return int(value) if value >= 0 else -1
+
+
 class HarHeader(LenientHarModel):
     """HTTP header name-value pair."""
 
@@ -130,9 +175,21 @@ class HarHeader(LenientHarModel):
 
 
 class HarPostData(LenientHarModel):
-    """POST request data."""
+    """POST request data (only the length of the text is kept)."""
 
     mime_type: str = Field("", alias="mimeType")
+    text_length: int = 0
+
+    @model_validator(mode="before")
+    @classmethod
+    def _keep_length_only(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        raw = dict(cast("dict[str, Any]", data))
+        text = raw.pop("text", None)
+        if isinstance(text, str) and "text_length" not in raw:
+            raw["text_length"] = len(text.encode("utf-8", errors="surrogatepass"))
+        return raw
 
 
 class HarRequest(LenientHarModel):
@@ -142,9 +199,14 @@ class HarRequest(LenientHarModel):
     url: str
     http_version: str = Field("", alias="httpVersion")
     headers: list[HarHeader] = Field(default_factory=list[HarHeader])
-    headers_size: int = Field(-1, alias="headersSize", ge=-1)
-    body_size: int = Field(-1, alias="bodySize", ge=-1)
+    headers_size: int = Field(-1, alias="headersSize")
+    body_size: int = Field(-1, alias="bodySize")
     post_data: HarPostData | None = Field(None, alias="postData")
+
+    @field_validator("headers_size", "body_size", mode="before")
+    @classmethod
+    def _sizes(cls, value: object) -> object:
+        return _size_or_unknown(value)
 
     @field_validator("url")
     @classmethod
@@ -156,33 +218,87 @@ class HarRequest(LenientHarModel):
             _ = parsed.port  # validates malformed and out-of-range ports
         return value
 
+    @property
+    def body_bytes(self) -> int:
+        """Request body bytes: the largest of ``bodySize``, the posted text and Content-Length.
+
+        Chrome records uploads with ``bodySize`` 0 and no ``postData``; Playwright's
+        WebKit counts only the text parts of a multipart body. ``Content-Length`` is what
+        was actually announced to the server. -1 when nothing was recorded.
+        """
+        candidates = [self.body_size]
+        if self.post_data is not None:
+            candidates.append(self.post_data.text_length)
+        candidates.extend(
+            int(header.value.strip())
+            for header in self.headers
+            if header.name.lower() == "content-length" and header.value.strip().isdigit()
+        )
+        return max(candidates)
+
 
 class HarContent(LenientHarModel):
-    """Response body details (``size`` is the uncompressed length)."""
+    """Response body details. ``text`` is kept only for 4xx/5xx responses (capped)."""
 
-    size: int = Field(default=-1, ge=-1)
+    size: int = Field(default=-1)
+    compression: int = -1  # bytes saved by Content-Encoding (-1 = not recorded)
     mime_type: str = Field("", alias="mimeType")
     text: str = ""  # body as recorded by the exporter (often absent)
     encoding: str = ""  # "base64" when ``text`` is base64-encoded
 
+    @field_validator("size", "compression", mode="before")
+    @classmethod
+    def _sizes(cls, value: object) -> object:
+        return _size_or_unknown(value)
+
 
 class HarResponse(LenientHarModel):
-    """HTTP response."""
+    """HTTP response. ``status`` 0 means no response was received."""
 
-    status: int = Field(ge=0, le=599)
+    status: int = Field(ge=0, le=HTTP_STATUS_MAX)
     status_text: str = Field("", alias="statusText")
+    http_version: str = Field("", alias="httpVersion")
     headers: list[HarHeader] = Field(default_factory=list[HarHeader])
     redirect_url: str = Field("", alias="redirectURL")
-    body_size: int = Field(-1, alias="bodySize", ge=-1)  # body bytes on the wire
+    headers_size: int = Field(-1, alias="headersSize")
+    body_size: int = Field(-1, alias="bodySize")  # encoded body bytes on the wire
     content: HarContent | None = None
-    transfer_size: int | None = Field(None, alias="_transferSize", ge=-1)
+    transfer_size: int | None = Field(None, alias="_transferSize")  # headers + body
     error: str | None = Field(None, alias="_error")
+    error_recorded_empty: bool = False  # ``_error`` present but empty (Chrome: blocked)
+    fetched_via_service_worker: bool = Field(False, alias="_fetchedViaServiceWorker")
+    service_worker_source: str = Field("", alias="_serviceWorkerResponseSource")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _producer_conventions(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        raw = dict(cast("dict[str, Any]", data))
+        # Playwright: status -1 = no response, reason in ``_failureText``.
+        if raw.get("status") == -1:
+            raw["status"] = 0
+        failure_text = raw.pop("_failureText", None)
+        if isinstance(failure_text, str) and failure_text and not raw.get("_error"):
+            raw["_error"] = failure_text
+        if raw.get("_error") == "":
+            raw["error_recorded_empty"] = True
+            raw["_error"] = None
+        transfer = raw.get("_transferSize")
+        if transfer is not None and (not isinstance(transfer, int | float) or transfer < 0):
+            raw["_transferSize"] = None
+        return raw
+
+    @field_validator("headers_size", "body_size", mode="before")
+    @classmethod
+    def _sizes(cls, value: object) -> object:
+        return _size_or_unknown(value)
 
     @field_validator("status")
     @classmethod
     def _validate_status(cls, value: int) -> int:
         if 0 < value < HTTP_STATUS_MIN:
-            raise ValueError("status must be 0 (no response) or 100 through 599")
+            raise ValueError("status must be 0 (no response) or 100 through 999")
         return value
 
 
@@ -223,6 +339,31 @@ class HarTimings(LenientHarModel):
         return sum(phase for phase in phases if phase >= 0)
 
 
+_TIMING_PHASES = ("blocked", "dns", "connect", "ssl", "send", "wait", "receive")
+_TOTAL_PHASES = ("blocked", "dns", "connect", "send", "wait", "receive")  # ssl is in connect
+_PLAIN_SCHEMES = frozenset({"http", "ws"})
+WEBSOCKET_MESSAGES_FIELD = "_webSocketMessages"
+
+
+def normalize_http_version(value: str) -> str:
+    """``HTTP/1.0``, ``HTTP/1.1``, ``HTTP/2``, ``HTTP/3``, or "" when not recorded.
+
+    Producers write ``h2``, ``http/2.0``, ``HTTP/2.0``, ``h3``, ``h3-29``, ``http/1.1`` ...
+    """
+    text = value.strip().lower()
+    if not text:
+        return ""
+    if text.startswith(("h3", "http/3", "http/2+quic")) or "quic" in text:
+        return "HTTP/3"
+    if text in ("h2", "h2c") or text.startswith("http/2"):
+        return "HTTP/2"
+    if text.startswith("http/1.0"):
+        return "HTTP/1.0"
+    if text.startswith(("http/1.1", "http/1")):
+        return "HTTP/1.1"
+    return value.strip()
+
+
 class HarEntry(LenientHarModel):
     """Single HTTP transaction."""
 
@@ -233,31 +374,60 @@ class HarEntry(LenientHarModel):
     cache: HarCache | None = None
     timings: HarTimings = Field(default_factory=HarTimings)
     server_ip_address: str | None = Field(None, alias="serverIPAddress")
-    connection: str | None = None
+    connection: str | None = None  # connection ID (never a port)
     from_cache: str | None = Field(None, alias="_fromCache")
     resource_type: str | None = Field(None, alias="_resourceType")
+    pageref: str | None = None
+    websocket_message_count: int = 0
     started_date_time_raw: str = ""  # startedDateTime exactly as written in the HAR
     timestamp_assumed_utc: bool = False  # startedDateTime had no UTC offset
     entry_index: int = 0  # 1-based position in the HAR file (0 = not loaded via load_har)
+    producer: str = ""  # log.creator.name of the capture (set by the loader)
     duration_source: str = "recorded"
     timing_warnings: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
-    def _keep_raw_start_and_derive_time(cls, data: Any) -> Any:
+    def _keep_raw_start_and_derive_time(  # noqa: PLR0912, PLR0915
+        cls, data: Any, info: ValidationInfo
+    ) -> Any:
         if not isinstance(data, dict):
             return data
         raw = dict(cast("dict[str, Any]", data))
         if "startedDateTime" in raw and "started_date_time_raw" not in raw:
             raw["started_date_time_raw"] = str(raw["startedDateTime"])
+        messages = raw.pop(WEBSOCKET_MESSAGES_FIELD, None)
+        if isinstance(messages, list):
+            raw["websocket_message_count"] = len(cast("list[object]", messages))
+        request = raw.get("request")
+        url = cast("dict[str, Any]", request).get("url", "") if isinstance(request, dict) else ""
+        parts = urlsplit(url) if isinstance(url, str) else urlsplit("")
+        # Chrome writes the server port in ``connection`` and the socket in
+        # ``_connectionId``; a value equal to the port is not a connection ID.
+        connection_id = raw.pop("_connectionId", None)
+        if connection_id not in (None, ""):
+            raw["connection"] = str(connection_id)
+        elif raw.get("connection") is not None:
+            try:
+                port = parts.port or {"https": 443, "wss": 443}.get(parts.scheme.lower(), 80)
+            except ValueError:
+                port = None
+            if str(raw["connection"]).strip() in ("", str(port)):
+                raw["connection"] = None
+            else:
+                raw["connection"] = str(raw["connection"])
         warnings = list(cast("list[str]", raw.get("timing_warnings", [])))
         raw_timings: object = raw.get("timings")
         if raw_timings is None:
             raw_timings = {}
         if not isinstance(raw_timings, dict):
             raise ValueError("timings must be an object")
-        phases = dict(cast("dict[str, Any]", raw_timings))
-        for name in ("blocked", "dns", "connect", "ssl", "send", "wait", "receive"):
+        phases = {
+            key: value
+            for key, value in cast("dict[str, Any]", raw_timings).items()
+            if key in _TIMING_PHASES
+        }
+        for name in _TIMING_PHASES:
             value = phases.get(name)
             if value is not None and (
                 isinstance(value, bool)
@@ -267,35 +437,63 @@ class HarEntry(LenientHarModel):
             ):
                 phases[name] = -1
                 warnings.append(f"invalid {name} timing excluded")
+        recorded = {
+            name: float(value)
+            for name, value in phases.items()
+            if isinstance(value, int | float) and value >= 0
+        }
+        total = raw.get("time")
+        total_is_number = (
+            isinstance(total, int | float) and not isinstance(total, bool) and math.isfinite(total)
+        )
+        context = cast("dict[str, object]", info.context or {})
+        producer = str(context.get("producer", "")).lower()
+        ssl = recorded.get("ssl", 0.0)
+        connect = recorded.get("connect", -1.0)
+        phase_sum = sum(recorded.get(name, 0.0) for name in _TOTAL_PHASES)
+        total_value = float(cast("float", total)) if total_is_number else -1.0
+        total_counts_ssl_again = (
+            ssl > 0
+            and math.isclose(total_value, phase_sum + ssl, rel_tol=0.001, abs_tol=0.05)
+            and not math.isclose(total_value, phase_sum, rel_tol=0.001, abs_tol=0.05)
+        )
+        if parts.scheme.lower() in _PLAIN_SCHEMES and "ssl" in recorded:
+            # No TLS on a plain connection: Playwright writes connectEnd + 1 here and
+            # adds it to ``time``.
+            phases["ssl"] = -1
+            del recorded["ssl"]
+            if total_counts_ssl_again:
+                raw["time"] = total = phase_sum
+                raw["duration_source"] = "corrected"
+        elif total_counts_ssl_again and (ssl > connect or producer == "mitmproxy"):
+            # ``connect`` without TLS (mitmproxy): make it include TLS as HAR 1.2 says.
+            phases["connect"] = connect + ssl if connect >= 0 else ssl
+            recorded["connect"] = float(phases["connect"])
+        elif total_counts_ssl_again:
+            # Playwright adds ``ssl`` to a ``connect`` that already contains it.
+            raw["time"] = total = phase_sum
+            raw["duration_source"] = "corrected"
         raw["timings"] = phases
-        if raw.get("time") is None:
+        if total is None:
             # Derive only when all mandatory phases are recorded. A partial sum is
             # a lower bound, not a measured request duration.
-            if all(
-                isinstance(phases.get(name), int | float) and phases[name] >= 0
-                for name in ("send", "wait", "receive")
-            ):
-                raw["time"] = sum(
-                    value
-                    for name, value in phases.items()
-                    if name in ("blocked", "dns", "connect", "send", "wait", "receive")
-                    and isinstance(value, int | float)
-                    and value >= 0
-                )
+            if all(name in recorded for name in ("send", "wait", "receive")):
+                raw["time"] = sum(recorded.get(name, 0.0) for name in _TOTAL_PHASES)
                 raw["duration_source"] = "derived"
             else:
                 raw["time"] = -1
                 raw["duration_source"] = "unavailable"
                 warnings.append("total timing unavailable")
         elif (
-            isinstance(raw["time"], bool)
-            or not isinstance(raw["time"], int | float)
-            or not math.isfinite(raw["time"])
-            or raw["time"] < 0
+            isinstance(total, bool)
+            or not isinstance(total, int | float)
+            or not math.isfinite(total)
+            or total < 0
         ):
             raw["time"] = -1
             raw["duration_source"] = "unavailable"
-            warnings.append("invalid total timing excluded")
+            if total != -1:
+                warnings.append("invalid total timing excluded")
         raw["timing_warnings"] = warnings
         return raw
 
@@ -316,19 +514,19 @@ class HarEntry(LenientHarModel):
             self.timing_warnings.append("timing outside representable timestamp range excluded")
         if self.timings.ssl > self.timings.connect >= 0:
             self.timing_warnings.append("TLS exceeds connect; exclusive connect timing unavailable")
-        phases = (
-            self.timings.blocked,
-            self.timings.dns,
-            self.timings.connect,
-            self.timings.send,
-            self.timings.wait,
-            self.timings.receive,
-        )
+        phases = [getattr(self.timings, name) for name in _TOTAL_PHASES]
         if self.time >= 0 and all(value >= 0 for value in phases[3:]):
             phase_sum = sum(value for value in phases if value >= 0)
             if not math.isclose(self.time, phase_sum, rel_tol=0.01, abs_tol=1):
                 self.timing_warnings.append("total timing differs from recorded phase sum")
         return self
+
+    @property
+    def http_version(self) -> str:
+        """Normalised protocol (response first, as the request may be a placeholder)."""
+        return normalize_http_version(self.response.http_version) or normalize_http_version(
+            self.request.http_version
+        )
 
 
 class HarCreator(LenientHarModel):
@@ -338,18 +536,52 @@ class HarCreator(LenientHarModel):
     version: str = ""
 
 
+class HarPageTimings(LenientHarModel):
+    """Page load milestones, in ms after the page's ``startedDateTime`` (-1 = unknown)."""
+
+    on_content_load: float = Field(-1.0, alias="onContentLoad")
+    on_load: float = Field(-1.0, alias="onLoad")
+
+    @field_validator("on_content_load", "on_load", mode="before")
+    @classmethod
+    def _milliseconds(cls, value: object) -> object:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return -1.0
+        return float(value) if value >= 0 and math.isfinite(value) else -1.0
+
+
+class HarPage(LenientHarModel):
+    """One page (navigation) of the capture."""
+
+    id: str = ""
+    started_date_time: datetime | None = Field(None, alias="startedDateTime")
+    title: str = ""
+    page_timings: HarPageTimings = Field(
+        default_factory=lambda: HarPageTimings.model_validate({}), alias="pageTimings"
+    )
+
+    @model_validator(mode="after")
+    def _assume_utc(self) -> Self:
+        if self.started_date_time is not None and self.started_date_time.tzinfo is None:
+            self.started_date_time = self.started_date_time.replace(tzinfo=UTC)
+        return self
+
+
 class HarLoadNotes(BaseModel):
     """What ``load_har`` left out or adjusted, so reports can say so."""
 
     skipped_entry_count: int = 0
     skipped_entry_reasons: list[str] = Field(default_factory=list[str])  # first few only
     non_http_entry_count: int = 0  # data:, blob:, chrome-extension:, about: ...
+    corrected_duration_count: int = 0  # totals that double-counted TLS (Playwright)
 
 
 class HarLog(LenientHarModel):
     """HAR log container."""
 
+    version: str = ""
     entries: list[HarEntry]
+    pages: list[HarPage] = Field(default_factory=list[HarPage])
     creator: HarCreator | None = None
     browser: HarCreator | None = None
 
@@ -365,61 +597,201 @@ NETWORK_URL_SCHEMES = frozenset({"http", "https", "ws", "wss"})
 SKIPPED_ENTRY_REASON_LIMIT = 5
 
 
+class HarFormatError(ValueError):
+    """The input is not a usable HAR document (exit code 3)."""
+
+
+def _slim_entry(raw_entry: object) -> object:
+    """Drop what the analysis never reads before validation (keeps memory bounded).
+
+    Response text is kept only for 4xx/5xx responses (error-page fingerprints), capped.
+    """
+    if not isinstance(raw_entry, dict):
+        return raw_entry
+    entry = cast("dict[str, Any]", raw_entry)
+    response = entry.get("response")
+    if isinstance(response, dict):
+        response_fields = cast("dict[str, Any]", response)
+        content = response_fields.get("content")
+        if isinstance(content, dict):
+            content_fields = cast("dict[str, Any]", content)
+            status = response_fields.get("status")
+            text = content_fields.get("text")
+            if isinstance(text, str):
+                if isinstance(status, int) and status >= HTTP_STATUS_BAD_REQUEST:
+                    content_fields["text"] = text[: ERROR_BODY_MAX_CHARS * 2]
+                else:
+                    content_fields.pop("text", None)
+    return entry
+
+
+class _HarAccumulator:
+    """Collects entries one at a time so a file never has to be held whole."""
+
+    def __init__(self, producer: str = "") -> None:
+        self.producer = producer
+        self.notes = HarLoadNotes()
+        self.entries: list[HarEntry] = []
+        self.raw_entry_count = 0
+
+    def add(self, raw_entry: object) -> None:
+        self.raw_entry_count += 1
+        entry_index = self.raw_entry_count
+        try:
+            entry = HarEntry.model_validate(
+                _slim_entry(raw_entry), context={"producer": self.producer}
+            )
+        except ValidationError as exc:
+            self.notes.skipped_entry_count += 1
+            if len(self.notes.skipped_entry_reasons) < SKIPPED_ENTRY_REASON_LIMIT:
+                first_error = exc.errors()[0]
+                field_path = ".".join(str(part) for part in first_error["loc"]) or "entry"
+                self.notes.skipped_entry_reasons.append(
+                    f"entry {entry_index}: {field_path}: {first_error['msg']}"
+                )
+            return
+        if urlsplit(entry.request.url).scheme.lower() not in NETWORK_URL_SCHEMES:
+            self.notes.non_http_entry_count += 1
+            return
+        entry.entry_index = entry_index
+        entry.producer = self.producer
+        self.notes.corrected_duration_count += entry.duration_source == "corrected"
+        self.entries.append(entry)
+
+    def build(self, log_fields: dict[str, Any]) -> Har:
+        if self.raw_entry_count and not self.entries:
+            reasons = "; ".join(self.notes.skipped_entry_reasons) or "no http(s) entries"
+            raise HarFormatError(
+                f"No usable entries in HAR ({self.raw_entry_count} present): {reasons}"
+            )
+
+        def creator(value: object) -> HarCreator | None:
+            try:
+                return HarCreator.model_validate(value) if isinstance(value, dict) else None
+            except ValidationError:
+                return None
+
+        pages: list[HarPage] = []
+        raw_pages = log_fields.get("pages")
+        if isinstance(raw_pages, list):
+            for raw_page in cast("list[object]", raw_pages):
+                try:
+                    pages.append(HarPage.model_validate(raw_page))
+                except ValidationError:
+                    continue
+        version = log_fields.get("version")
+        # Entries are already validated: construct the containers without re-running
+        # entry validators (which would repeat their warnings).
+        return Har.model_construct(
+            log=HarLog.model_construct(
+                version=version if isinstance(version, str) else "",
+                entries=self.entries,
+                pages=pages,
+                creator=creator(log_fields.get("creator")),
+                browser=creator(log_fields.get("browser")),
+            ),
+            load_notes=self.notes,
+        )
+
+
 def load_har(raw_data: object) -> Har:
-    """Build a ``Har`` from parsed JSON, entry by entry.
+    """Build a ``Har`` from already-parsed JSON, entry by entry.
 
     An entry that cannot be used (no URL, start time or status) is skipped and counted
     instead of rejecting the capture; entries that never touched the network (``data:``,
-    ``blob:``, browser-extension URLs) are dropped and counted. Raises ValueError when the
-    document is not a HAR or no entry is usable.
+    ``blob:``, browser-extension URLs) are dropped and counted. Raises HarFormatError
+    when the document is not a HAR or no entry is usable.
     """
     log_data = cast("dict[str, Any]", raw_data).get("log") if isinstance(raw_data, dict) else None
     if not isinstance(log_data, dict):
-        raise ValueError("Not a HAR file: no top-level 'log' object")
+        raise HarFormatError("Not a HAR file: no top-level 'log' object")
     log_fields = cast("dict[str, Any]", log_data)
     raw_entries = log_fields.get("entries")
     if not isinstance(raw_entries, list):
-        raise ValueError("Not a HAR file: 'log.entries' is not a list")
-
-    raw_entry_list = cast("list[object]", raw_entries)
-    notes = HarLoadNotes()
-    entries: list[HarEntry] = []
-    for entry_index, raw_entry in enumerate(raw_entry_list, start=1):
-        try:
-            entry = HarEntry.model_validate(raw_entry)
-        except ValidationError as exc:
-            notes.skipped_entry_count += 1
-            if len(notes.skipped_entry_reasons) < SKIPPED_ENTRY_REASON_LIMIT:
-                first_error = exc.errors()[0]
-                field_path = ".".join(str(part) for part in first_error["loc"]) or "entry"
-                notes.skipped_entry_reasons.append(
-                    f"entry {entry_index}: {field_path}: {first_error['msg']}"
-                )
-            continue
-        if urlsplit(entry.request.url).scheme.lower() not in NETWORK_URL_SCHEMES:
-            notes.non_http_entry_count += 1
-            continue
-        entry.entry_index = entry_index
-        entries.append(entry)
-
-    if raw_entry_list and not entries:
-        reasons = "; ".join(notes.skipped_entry_reasons) or "no http(s) entries"
-        raise ValueError(f"No usable entries in HAR ({len(raw_entry_list)} present): {reasons}")
-
-    def creator(value: object) -> HarCreator | None:
-        try:
-            return HarCreator.model_validate(value) if isinstance(value, dict) else None
-        except ValidationError:
-            return None
-
-    return Har(
-        log=HarLog(
-            entries=entries,
-            creator=creator(log_fields.get("creator")),
-            browser=creator(log_fields.get("browser")),
-        ),
-        load_notes=notes,
+        raise HarFormatError("Not a HAR file: 'log.entries' is not a list")
+    creator_fields = log_fields.get("creator")
+    producer = (
+        str(cast("dict[str, Any]", creator_fields).get("name", ""))
+        if isinstance(creator_fields, dict)
+        else ""
     )
+    accumulator = _HarAccumulator(producer)
+    for raw_entry in cast("list[object]", raw_entries):
+        accumulator.add(raw_entry)
+    return accumulator.build(log_fields)
+
+
+_UTF8_BOM = b"\xef\xbb\xbf"
+_CREATOR_NAME_RE = re.compile(rb'"creator"\s*:\s*\{[^{}]*?"name"\s*:\s*"([^"\\]{1,100})"')
+CREATOR_SCAN_BYTES = 65_536
+_ENTRY_PREFIX = "log.entries.item"
+_LOG_SCALARS = ("log.version", "log.creator", "log.browser", "log.pages")
+
+
+class _HarEventCollector:
+    """Turns ijson events into log fields and entries (one entry built at a time)."""
+
+    def __init__(self, accumulator: _HarAccumulator) -> None:
+        self.accumulator = accumulator
+        self.log_fields: dict[str, Any] = {}
+        self.saw_log = False
+        self.saw_entries = False
+        self._builder: ObjectBuilder | None = None
+        self._builder_prefix = ""
+
+    def feed(self, prefix: str, event: str, value: object) -> None:
+        if self._builder is not None:
+            self._builder.event(event, value)
+            if prefix == self._builder_prefix and event in ("end_map", "end_array"):
+                self._finish(self._builder.value)
+            return
+        if prefix == "log" and event == "start_map":
+            self.saw_log = True
+        elif prefix == "log.entries" and event == "start_array":
+            self.saw_entries = True
+        elif prefix == _ENTRY_PREFIX or prefix in _LOG_SCALARS:
+            if event in ("start_map", "start_array"):
+                self._builder = ObjectBuilder()
+                self._builder.event(event, value)
+                self._builder_prefix = prefix
+            else:  # a scalar where an object was expected
+                self._builder_prefix = prefix
+                self._finish(value)
+
+    def _finish(self, value: object) -> None:
+        if self._builder_prefix == _ENTRY_PREFIX:
+            self.accumulator.add(value)
+        else:
+            self.log_fields[self._builder_prefix.removeprefix("log.")] = value
+        self._builder = None
+
+
+def load_har_file(path: Path) -> Har:
+    """Stream a HAR file from disk: one entry is in memory as raw JSON at a time.
+
+    Response bodies of non-error responses are discarded as each entry is read, so
+    memory use grows with the number of entries, not with the size of the bodies.
+    Raises HarFormatError for files that are not JSON or not a HAR.
+    """
+    with path.open("rb") as handle:
+        head = handle.read(CREATOR_SCAN_BYTES)
+    creator_match = _CREATOR_NAME_RE.search(head)
+    collector = _HarEventCollector(
+        _HarAccumulator(creator_match.group(1).decode() if creator_match else "")
+    )
+    with path.open("rb") as handle:
+        if handle.read(len(_UTF8_BOM)) != _UTF8_BOM:  # Windows tools write a BOM
+            handle.seek(0)
+        try:
+            for prefix, event, value in iter_json_events(handle):
+                collector.feed(prefix, event, value)
+        except JSONStreamError as exc:
+            raise HarFormatError(f"Not valid JSON: {exc}") from exc
+    if not collector.saw_log:
+        raise HarFormatError("Not a HAR file: no top-level 'log' object")
+    if not collector.saw_entries:
+        raise HarFormatError("Not a HAR file: 'log.entries' is not a list")
+    return collector.accumulator.build(collector.log_fields)
 
 
 # =============================================================================
@@ -567,32 +939,64 @@ def redact_url(url: str, *, show_query: bool = False) -> str:
 
 
 # Network error classification. Chrome records ``_error: "net::ERR_*"``; Firefox uses
-# ``NS_*`` names. Order matters: the first matching category wins.
-INFORMATIONAL_ERROR_CATEGORIES = frozenset({"aborted", "blocked_by_client"})
+# ``NS_*`` names; WebKit (via Playwright) and mitmproxy write free text. Matching is
+# case-insensitive on substrings; the first matching category wins, so specific
+# markers come before general ones.
+INFORMATIONAL_ERROR_CATEGORIES = frozenset(
+    {"aborted", "blocked_by_client", "blocked_by_page_policy", "not_sent"}
+)
 _NETWORK_ERROR_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("aborted", ("ERR_ABORTED", "ERR_CANCELED", "ERR_CANCELLED", "NS_BINDING_ABORTED")),
-    ("blocked_by_client", ("ERR_BLOCKED_BY_CLIENT",)),
+    (
+        "aborted",
+        (
+            "ERR_ABORTED",
+            "ERR_CANCELED",
+            "ERR_CANCELLED",
+            "NS_BINDING_ABORTED",
+            "LOAD REQUEST CANCELLED",  # WebKit
+            "CLIENT DISCONNECTED",  # mitmproxy: the browser went away
+        ),
+    ),
+    ("blocked_by_client", ("ERR_BLOCKED_BY_CLIENT", "NS_ERROR_TRACKING_URI")),
+    # The page's own policy stopped the request before it was sent (Playwright writes
+    # the reason: "csp", "mixed-content", "inspector", ...).
+    (
+        "blocked_by_page_policy",
+        ("ERR_BLOCKED_BY_CSP", "MIXED-CONTENT", "MIXED_CONTENT", "NS_ERROR_CONTENT_BLOCKED"),
+    ),
     # The server's own headers (CORP/COEP/X-Frame-Options, opaque-response blocking)
     # made the browser discard the response: a server-side configuration matter.
     ("blocked_by_response_policy", ("ERR_BLOCKED_BY_RESPONSE", "ERR_BLOCKED_BY_ORB")),
+    ("cors_rejected", ("NOT ALLOWED BY ACCESS-CONTROL-ALLOW-ORIGIN", "CORS")),
     (
-        "connection_reset",
+        "connection_refused",
         (
-            "ERR_CONNECTION_RESET",
-            "ERR_CONNECTION_CLOSED",
-            "ERR_CONNECTION_ABORTED",
-            "NS_ERROR_NET_RESET",
-            "NS_ERROR_NET_INTERRUPT",
+            "ERR_CONNECTION_REFUSED",
+            "NS_ERROR_CONNECTION_REFUSED",
+            "CONNECTION REFUSED",
+            "CONNECT CALL FAILED",
         ),
     ),
-    ("connection_refused", ("ERR_CONNECTION_REFUSED", "NS_ERROR_CONNECTION_REFUSED")),
-    ("timed_out", ("ERR_TIMED_OUT", "ERR_CONNECTION_TIMED_OUT", "NS_ERROR_NET_TIMEOUT")),
+    (
+        "timed_out",
+        ("ERR_TIMED_OUT", "ERR_CONNECTION_TIMED_OUT", "NS_ERROR_NET_TIMEOUT", "TIMED OUT"),
+    ),
     (
         "dns",
-        ("ERR_NAME_NOT_RESOLVED", "ERR_NAME_RESOLUTION_FAILED", "NS_ERROR_UNKNOWN_HOST"),
+        (
+            "ERR_NAME_NOT_RESOLVED",
+            "ERR_NAME_RESOLUTION_FAILED",
+            "NS_ERROR_UNKNOWN_HOST",
+            "NAME OR SERVICE NOT KNOWN",
+            "ERROR RESOLVING",
+            "NODENAME NOR SERVNAME",
+            "COULD NOT RESOLVE",
+        ),
     ),
-    ("tls", ("ERR_SSL_", "ERR_CERT_", "SSL_ERROR_", "SEC_ERROR_")),
-    ("empty_response", ("ERR_EMPTY_RESPONSE",)),
+    (
+        "tls",
+        ("ERR_SSL_", "ERR_CERT_", "SSL_ERROR_", "SEC_ERROR_", "ERR_QUIC_HANDSHAKE", "CERTIFICATE"),
+    ),
     # The response started and was cut off, or the stream was reset part-way.
     (
         "truncated_response",
@@ -605,6 +1009,20 @@ _NETWORK_ERROR_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
             "ERR_QUIC_PROTOCOL_ERROR",
             "ERR_RESPONSE_HEADERS_TRUNCATED",
             "NS_ERROR_NET_PARTIAL_TRANSFER",
+        ),
+    ),
+    ("empty_response", ("ERR_EMPTY_RESPONSE",)),
+    (
+        "connection_reset",
+        (
+            "ERR_CONNECTION_RESET",
+            "ERR_CONNECTION_CLOSED",
+            "ERR_CONNECTION_ABORTED",
+            "NS_ERROR_NET_RESET",
+            "NS_ERROR_NET_INTERRUPT",
+            "CONNECTION RESET",
+            "CONNECTION TERMINATED UNEXPECTEDLY",  # WebKit
+            "SERVER CLOSED CONNECTION",  # mitmproxy
         ),
     ),
     (
@@ -624,14 +1042,24 @@ _NETWORK_ERROR_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
             "NS_ERROR_OFFLINE",
         ),
     ),
-    ("too_many_redirects", ("ERR_TOO_MANY_REDIRECTS", "NS_ERROR_REDIRECT_LOOP")),
+    (
+        "too_many_redirects",
+        ("ERR_TOO_MANY_REDIRECTS", "NS_ERROR_REDIRECT_LOOP", "CANNOT FOLLOW MORE THAN"),
+    ),
     # Chrome reports net::ERR_FAILED for CORS rejections and other unspecific failures.
     ("generic_failure", ("ERR_FAILED",)),
 )
+# How informational categories are named to the reader.
+INFORMATIONAL_LABELS: dict[str, str] = {
+    "aborted": "cancelled by the browser",
+    "blocked_by_client": "blocked by a browser extension",
+    "blocked_by_page_policy": "blocked by the page's own policy (CSP, mixed content)",
+    "not_sent": "not sent by the browser (no reason recorded; often CSP)",
+}
 
 # What each category is consistent with (shown only for categories that occurred).
 NETWORK_ERROR_HINTS: dict[str, str] = {
-    "connection_reset": "a proxy or server closed the connection",
+    "connection_reset": "a proxy or server closed or reset the connection",
     "connection_refused": "nothing was listening on the address (service down or blocked)",
     "timed_out": "no answer at the network level (firewall drop, host down, overload)",
     "dns": "the hostname did not resolve on the client",
@@ -650,6 +1078,10 @@ NETWORK_ERROR_HINTS: dict[str, str] = {
     "blocked_by_response_policy": (
         "the server's response headers (CORP/COEP/X-Frame-Options) made the browser discard it"
     ),
+    "cors_rejected": (
+        "the browser received a response but refused it, most often because it lacked the "
+        "CORS headers the page's origin needs"
+    ),
     "generic_failure": "unspecific browser failure (often a CORS rejection; see the console)",
     "no_response": "no HTTP response or error reason was recorded; cause unknown",
     "other": "an error this tool does not classify",
@@ -659,18 +1091,55 @@ NETWORK_ERROR_HINTS: dict[str, str] = {
 def classify_network_error(entry: HarEntry) -> str | None:
     """Return a network error category, or None when the request got a response.
 
-    ``aborted`` / ``blocked_by_client`` are informational (user navigated away, app
-    cancelled polling, ad blocker); every other category is a real failure. An empty
-    error string is the same as no error.
+    ``aborted``, ``blocked_by_client``, ``blocked_by_page_policy`` and ``not_sent`` are
+    informational (user navigated away, app cancelled polling, ad blocker, the page's
+    Content-Security-Policy); every other category is a real failure.
     """
     error = entry.response.error
     if not error:
-        return "no_response" if entry.response.status == 0 else None
+        return _classify_without_error_text(entry)
     error_upper = error.upper()
-    for category, markers in _NETWORK_ERROR_CATEGORIES:
-        if any(marker in error_upper for marker in markers):
-            return category
-    return "other"
+    category = next(
+        (
+            name
+            for name, markers in _NETWORK_ERROR_CATEGORIES
+            if any(marker in error_upper for marker in markers)
+        ),
+        None,
+    )
+    if category is None:
+        return "blocked_by_page_policy" if error_upper.strip() in _POLICY_REASONS else "other"
+    if entry.response.status > 0:
+        # A status line arrived first: a later abort does not undo it (the browser
+        # stopped reading), a close means the body was cut off, and a generic failure
+        # on a received response is the browser refusing it (Chrome reports CORS
+        # rejections this way).
+        return _AFTER_STATUS_CATEGORY.get(category, category)
+    return category
+
+
+_POLICY_REASONS = frozenset({"CSP", "INSPECTOR", "SUBRESOURCE-FILTER", "DEVTOOLS"})
+_AFTER_STATUS_CATEGORY: dict[str, str | None] = {
+    "aborted": None,
+    "connection_reset": "truncated_response",
+    "empty_response": "truncated_response",
+    "generic_failure": "cors_rejected",
+}
+
+
+def _classify_without_error_text(entry: HarEntry) -> str | None:
+    """No error text: a response was received, never sent, or not recorded at all."""
+    if entry.response.status != 0:
+        return None
+    timings = entry.timings
+    nothing_sent = all(
+        value <= 0 for value in (timings.dns, timings.connect, timings.send, timings.wait)
+    )
+    # Chrome writes ``_error: ""`` for requests its own policy stopped (CSP, mixed
+    # content); they never reached the network.
+    if entry.response.error_recorded_empty and nothing_sent:
+        return "not_sent"
+    return "no_response"
 
 
 def is_real_network_error(entry: HarEntry) -> bool:
@@ -824,12 +1293,12 @@ def long_lived_kind(entry: HarEntry) -> str | None:
     """
     resource_type = (entry.resource_type or "").lower()
     status = entry.response.status
-    is_websocket = (
-        resource_type == "websocket"
-        or urlsplit(entry.request.url).scheme.lower() in ("ws", "wss")
-        or status == HTTP_STATUS_SWITCHING_PROTOCOLS
+    is_websocket = resource_type == "websocket" or urlsplit(entry.request.url).scheme.lower() in (
+        "ws",
+        "wss",
     )
-    if is_websocket and status == HTTP_STATUS_SWITCHING_PROTOCOLS:
+    # HTTP/1.1 upgrades answer 101; WebSockets over HTTP/2 (RFC 8441) and HTTP/3 answer 200.
+    if status == HTTP_STATUS_SWITCHING_PROTOCOLS or (is_websocket and status == HTTP_STATUS_OK):
         return "websocket"
     is_event_stream = resource_type == "eventsource" or response_content_type(entry).startswith(
         "text/event-stream"
@@ -847,12 +1316,36 @@ def request_active_ms(entry: HarEntry) -> float:
     return max(entry.time - max(entry.timings.blocked, 0.0), 0.0)
 
 
-def response_uncompressed_bytes(entry: HarEntry) -> int:
-    """Body size after decoding (``content.size``), falling back to the wire size."""
+def content_encoding(entry: HarEntry) -> str:
+    """Response ``Content-Encoding`` lower-cased ("identity" when absent)."""
+    value = (response_header(entry, "content-encoding") or "").strip().lower()
+    return value or "identity"
+
+
+def decoded_body_bytes(entry: HarEntry) -> int:
+    """Size of the response body after decoding, or -1 when the capture does not say.
+
+    0 for 304 and HEAD (no body crossed). Producers disagree on ``content.size``:
+    mitmproxy writes the encoded size there, so ``bodySize + compression`` is used
+    when it is larger.
+    """
+    if entry.response.status == HTTP_STATUS_NOT_MODIFIED or entry.request.method == "HEAD":
+        return 0
     content = entry.response.content
-    if content and content.size > 0:
-        return content.size
-    return max(entry.response.body_size, 0)
+    size = content.size if content else -1
+    body = entry.response.body_size
+    if content and content.compression > 0 and body >= 0:
+        size = max(size, body + content.compression)
+    if content_encoding(entry) != "identity":
+        return size
+    declared = response_header(entry, "content-length") or ""
+    # Unencoded: Content-Length is the body size. Chrome writes content.size 0 when a
+    # service worker consumed the body, and its bodySize is one byte high on HTTP/1.1.
+    if declared.strip().isdigit() and (size < 0 or (size == 0 and body > 0)):
+        return int(declared.strip())
+    if size >= 0:
+        return size
+    return body
 
 
 def request_sent_time(entry: HarEntry) -> datetime | None:
@@ -861,7 +1354,7 @@ def request_sent_time(entry: HarEntry) -> datetime | None:
     if (
         timings.send < 0
         or classify_network_error(entry) in PRE_SEND_ERROR_CATEGORIES
-        or HarAnalyzer.is_browser_cache_hit(entry)
+        or HarAnalyzer.is_served_locally(entry)
     ):
         return None
     phases = (timings.blocked, timings.dns, timings.connect, timings.send)
@@ -880,7 +1373,15 @@ def response_headers_time(entry: HarEntry) -> datetime | None:
 
 
 PRE_SEND_ERROR_CATEGORIES = frozenset(
-    {"dns", "tls", "connection_refused", "proxy_tunnel", "blocked_by_client"}
+    {
+        "dns",
+        "tls",
+        "connection_refused",
+        "proxy_tunnel",
+        "blocked_by_client",
+        "blocked_by_page_policy",
+        "not_sent",
+    }
 )
 
 
@@ -921,12 +1422,12 @@ class RequestHeaderSize:
         )
 
     def describe(self) -> str:
-        """``9.1 KB (largest field Cookie 9.0 KB; summed from recorded headers)``."""
-        text = f"{self.total_bytes / 1024:.1f} KB"
+        """``9.1 KiB (largest field Cookie 9.0 KiB; estimated from the captured request)``."""
+        text = format_bytes(self.total_bytes)
         parts: list[str] = []
         if self.largest_field:
             parts.append(
-                f"largest field {self.largest_field} {self.largest_field_bytes / 1024:.1f} KB"
+                f"largest field {self.largest_field} {format_bytes(self.largest_field_bytes)}"
             )
         if self.computed:
             parts.append("estimated from the captured request; headers may be omitted")
@@ -959,7 +1460,6 @@ def request_header_size(entry: HarEntry) -> RequestHeaderSize | None:
 # Error response fingerprint (which tier wrote the error page)
 # -----------------------------------------------------------------------------
 
-ERROR_BODY_MAX_CHARS = 65_536
 FORM_URLENCODED = "application/x-www-form-urlencoded"
 # Tomcat maxPostSize: default 2 MiB of form body is parsed into request parameters.
 TOMCAT_MAX_POST_SIZE_BYTES = 2_097_152
@@ -1190,7 +1690,7 @@ def tail_label(stats: TimingStatistics) -> str:
 
 def tail_value(stats: TimingStatistics) -> float:
     """p95 when n >= 20; with fewer samples p95 is meaningless, so use max."""
-    return stats.p95 if stats.count >= MIN_SAMPLES_FOR_TAIL_PERCENTILES else stats.max
+    return known_ms(stats.p95 if stats.count >= MIN_SAMPLES_FOR_TAIL_PERCENTILES else stats.max)
 
 
 # =============================================================================
@@ -1359,15 +1859,20 @@ class DetectedIssue(BaseModel):
 
 
 class TimingStatistics(BaseModel):
-    """Statistical timing analysis."""
+    """Timing statistics in milliseconds; every figure is None when ``count`` is 0."""
 
-    count: int
-    p50: float
-    p95: float
-    p99: float
-    max: float
-    mean: float
-    total_duration_ms: float
+    count: int = 0
+    p50: float | None = None
+    p95: float | None = None
+    p99: float | None = None
+    max: float | None = None
+    mean: float | None = None
+    total_duration_ms: float = 0.0
+
+
+def known_ms(value: float | None) -> float:
+    """A statistic for display: -1 (shown as "-") when there were no samples."""
+    return -1.0 if value is None else value
 
 
 class DomainAnalysis(BaseModel):
@@ -1376,7 +1881,7 @@ class DomainAnalysis(BaseModel):
     domain: str
     total_requests: int
     failed_requests: int
-    error_rate: float
+    failure_rate_pct: float  # failed requests as a percentage of the host's requests
     timing_stats: TimingStatistics
     status_codes: dict[int, int]
     issue_count: int
@@ -1414,11 +1919,7 @@ class EndpointStats(BaseModel):
     server_timings: dict[str, TimingStatistics] = Field(default_factory=dict)
     # Wait for the first byte (total minus queueing when wait is not recorded) of the
     # responses that were not 5xx: what "slow endpoint" is judged on.
-    served_wait_timings: TimingStatistics = Field(
-        default_factory=lambda: TimingStatistics(
-            count=0, p50=0, p95=0, p99=0, max=0, mean=0, total_duration_ms=0
-        )
-    )
+    served_wait_timings: TimingStatistics = Field(default_factory=TimingStatistics)
 
 
 class ServiceFailureStats(BaseModel):
@@ -1468,7 +1969,7 @@ class ServiceFailureStats(BaseModel):
 
 
 class LargeRequestBody(BaseModel):
-    """Large POST/PUT request payload (>100KB)."""
+    """Request body above the large-request-body threshold."""
 
     url: str
     method: str
@@ -1614,7 +2115,6 @@ class TimeoutCluster(BaseModel):
     min_ms: float
     max_ms: float
     median_ms: float
-    round_value_s: float
     status_codes: dict[int, int]
     endpoints: dict[str, int]  # endpoint template -> count
     first_seen: datetime
@@ -1641,6 +2141,7 @@ class LatencyPopulation(BaseModel):
     network_error_count: int
     timing_unavailable_count: int = 0
     cache_source_unknown_count: int = 0
+    service_worker_count: int = 0
 
 
 class ErrorOrigin(BaseModel):
@@ -1743,6 +2244,23 @@ class Incident(BaseModel):
     where_to_look: list[str] = Field(default_factory=list)
 
 
+class PageSummary(BaseModel):
+    """One page (navigation) of the capture, with its load milestones.
+
+    Milestones are milliseconds after the page started (-1 when not recorded); the
+    requests are those whose ``pageref`` names the page.
+    """
+
+    page_id: str
+    title: str  # usually the page URL
+    started: datetime | None
+    dom_content_loaded_ms: float = -1.0
+    load_ms: float = -1.0
+    request_count: int = 0
+    failed_count: int = 0
+    last_response_end_ms: float = -1.0  # last request of the page finished, after start
+
+
 class BackendNodeStats(BaseModel):
     """Responses grouped by the X-Served-By value reported in the capture."""
 
@@ -1793,7 +2311,8 @@ class HarAnalysisReport(BaseModel):
     settings: AnalyzerSettings = Field(default_factory=AnalyzerSettings)
     timeout_clusters: list[TimeoutCluster] = Field(default_factory=list)
     network_errors_by_category: dict[str, int] = Field(default_factory=dict)
-    aborted_request_count: int = 0  # informational network errors
+    aborted_request_count: int = 0  # informational: cancelled, blocked or never sent
+    informational_by_category: dict[str, int] = Field(default_factory=dict)
     expected_response_count: int = 0
     config_facts_loaded: int = 0
     slowest_requests: list[RequestSummary] = Field(default_factory=list)
@@ -1825,6 +2344,7 @@ class HarAnalysisReport(BaseModel):
     log_correlation: list[RequestSummary] = Field(default_factory=list)
     max_request_header_bytes: int = 0
     max_request_header_note: str = ""
+    pages: list[PageSummary] = Field(default_factory=list)
     error_body_count: int = 0  # 4xx/5xx responses whose body text the capture kept
     error_response_count: int = 0  # 4xx/5xx responses in all
 
@@ -1842,7 +2362,6 @@ class HarAnalyzer:
     HTTP_STATUS_FORBIDDEN = 403
     HTTP_STATUS_RATE_LIMITED = 429
     HTTP_STATUS_SERVER_ERROR_MIN = 500
-    HTTP_STATUS_ERROR_MAX = 600
     REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
     DOMAIN_ERROR_RATE_CRITICAL_PCT = 50.0
@@ -1917,7 +2436,7 @@ class HarAnalyzer:
         return (
             entry.time >= 0
             and classify_network_error(entry) is None
-            and not self.is_browser_cache_hit(entry)
+            and not self.is_served_locally(entry)
             and not self.is_cache_source_unknown(entry)
         )
 
@@ -1926,8 +2445,8 @@ class HarAnalyzer:
         """A 200 without local-cache or positive network evidence has unknown source."""
         return (
             entry.response.status == HTTP_STATUS_OK
-            and not HarAnalyzer.is_browser_cache_hit(entry)
-            and HarAnalyzer.transferred_bytes(entry) == 0
+            and not HarAnalyzer.is_served_locally(entry)
+            and HarAnalyzer.wire_bytes(entry) <= 0
             and not any(
                 value > 0
                 for value in (
@@ -1950,30 +2469,65 @@ class HarAnalyzer:
         return f"{parsed.scheme}://{parsed.netloc}{self.path_template(url)}"
 
     @staticmethod
-    def transferred_bytes(entry: HarEntry) -> int:
-        """Bytes that crossed the network (0 for browser-cache hits)."""
-        if HarAnalyzer.is_browser_cache_hit(entry):
+    def wire_bytes(entry: HarEntry) -> int:
+        """Response bytes that crossed the network (headers + body); -1 when unknown.
+
+        0 for responses served by the browser cache or a service worker. Uses
+        ``_transferSize`` when recorded, else ``headersSize + bodySize``, else
+        ``bodySize`` alone (a lower bound; counted as "body bytes only").
+        """
+        if HarAnalyzer.is_served_locally(entry):
             return 0
-        transfer_size = entry.response.transfer_size
-        if transfer_size is not None and transfer_size >= 0:
-            return transfer_size
-        return max(entry.response.body_size, 0)
+        response = entry.response
+        if response.transfer_size is not None and response.transfer_size >= 0:
+            return response.transfer_size
+        if response.status == 0:
+            return 0  # no response arrived
+        if response.headers_size >= 0 and response.body_size >= 0:
+            return response.headers_size + response.body_size
+        return response.body_size
+
+    @staticmethod
+    def is_service_worker_response(entry: HarEntry) -> bool:
+        """True when a service worker answered (Chrome ``_fetchedViaServiceWorker``).
+
+        If the worker fetched from the network, that fetch is its own entry in the
+        capture, so this one is not counted as network traffic a second time.
+        """
+        return entry.response.fetched_via_service_worker
 
     @staticmethod
     def is_browser_cache_hit(entry: HarEntry) -> bool:
         """Return True when the browser served the response from memory/disk cache.
 
-        Signals: known memory/disk ``_fromCache`` values, or a 200 with
-        ``_transferSize`` 0. ``cache.beforeRequest`` is metadata, not proof of a hit.
+        Chrome DevTools marks every hit with ``_fromCache`` (memory or disk), so for its
+        captures that marker alone decides. Other producers (Playwright) write no marker:
+        a 200 with ``_transferSize`` 0, no error and no DNS or connection setup is a hit.
+        (A response the browser blocked, such as ORB, also has ``_transferSize`` 0, but it
+        was fetched over a connection.) ``cache.beforeRequest`` is not proof of a hit.
         """
-        if entry.response.status == HTTP_STATUS_NOT_MODIFIED:
+        if (
+            entry.response.status == HTTP_STATUS_NOT_MODIFIED
+            or entry.response.fetched_via_service_worker
+        ):
             return False
         if entry.from_cache in ("memory", "disk", "memory-cache", "disk-cache"):
             return True
+        if entry.producer == CHROME_DEVTOOLS_PRODUCER:
+            return False
         return (
             entry.response.status == HTTP_STATUS_OK
             and entry.response.transfer_size == 0
             and not entry.response.error
+            and entry.timings.dns <= 0
+            and entry.timings.connect <= 0
+        )
+
+    @staticmethod
+    def is_served_locally(entry: HarEntry) -> bool:
+        """Answered without the network: browser cache or service worker."""
+        return HarAnalyzer.is_browser_cache_hit(entry) or HarAnalyzer.is_service_worker_response(
+            entry
         )
 
     # -------------------------------------------------------------------------
@@ -1994,14 +2548,15 @@ class HarAnalyzer:
         phase_stats = self._phase_stats(measured)
         status_codes: dict[int, int] = defaultdict(int)
         network_errors_by_category: dict[str, int] = defaultdict(int)
-        aborted_request_count = 0
+        informational_by_category: dict[str, int] = defaultdict(int)
         for entry in entries:
             status_codes[entry.response.status] += 1
             category = classify_network_error(entry)
             if category in INFORMATIONAL_ERROR_CATEGORIES:
-                aborted_request_count += 1
+                informational_by_category[category] += 1
             elif category is not None:
                 network_errors_by_category[category] += 1
+        aborted_request_count = sum(informational_by_category.values())
 
         # Capture window: first request start to last request end (start + time)
         capture_start = min((e.started_date_time for e in entries), default=None)
@@ -2020,7 +2575,7 @@ class HarAnalyzer:
         report = HarAnalysisReport(
             total_requests=len(entries),
             total_duration_ms=sum(e.time for e in entries if e.time >= 0),
-            total_bytes_transferred=sum(self.transferred_bytes(e) for e in entries),
+            total_bytes_transferred=sum(max(self.wire_bytes(e), 0) for e in entries),
             overall_timings=self._compute_timing_stats([e.time for e in measured]),
             blocked_timings=phase_stats["Blocked"],
             dns_timings=phase_stats["DNS"],
@@ -2055,6 +2610,7 @@ class HarAnalyzer:
                 sorted(network_errors_by_category.items(), key=lambda kv: (-kv[1], kv[0]))
             ),
             aborted_request_count=aborted_request_count,
+            informational_by_category=dict(sorted(informational_by_category.items())),
             expected_response_count=sum(
                 1 for e in entries if self.outcome(e) == RequestOutcome.EXPECTED
             ),
@@ -2071,6 +2627,11 @@ class HarAnalyzer:
                     for e in entries
                     if classify_network_error(e) is None and self.is_browser_cache_hit(e)
                 ),
+                service_worker_count=sum(
+                    1
+                    for e in entries
+                    if classify_network_error(e) is None and self.is_service_worker_response(e)
+                ),
                 aborted_count=aborted_request_count,
                 network_error_count=sum(network_errors_by_category.values()),
                 timing_unavailable_count=sum(
@@ -2078,7 +2639,7 @@ class HarAnalyzer:
                     for e in entries
                     if e.time < 0
                     and classify_network_error(e) is None
-                    and not self.is_browser_cache_hit(e)
+                    and not self.is_served_locally(e)
                 ),
                 cache_source_unknown_count=sum(
                     e.time >= 0
@@ -2099,16 +2660,13 @@ class HarAnalyzer:
             ][:5],
             derived_duration_count=sum(e.duration_source == "derived" for e in entries),
             unavailable_duration_count=sum(e.time < 0 for e in entries),
-            transfer_unknown_count=sum(
-                not self.is_browser_cache_hit(e)
-                and e.response.body_size < 0
-                and (e.response.transfer_size is None or e.response.transfer_size < 0)
-                for e in entries
-            ),
+            transfer_unknown_count=sum(self.wire_bytes(e) < 0 for e in entries),
             transfer_body_only_count=sum(
-                not self.is_browser_cache_hit(e)
+                not self.is_served_locally(e)
+                and e.response.status != 0
+                and e.response.transfer_size is None
+                and e.response.headers_size < 0
                 and e.response.body_size >= 0
-                and (e.response.transfer_size is None or e.response.transfer_size < 0)
                 for e in entries
             ),
             backend_unknown_request_count=sum(self.backend_node(e) is None for e in entries),
@@ -2120,6 +2678,7 @@ class HarAnalyzer:
             timeline_bucket_seconds=timeline_bucket_seconds,
             incidents=self._incidents(entries, timeout_clusters),
             log_correlation=self._log_correlation(entries),
+            pages=self._page_summaries(har.log.pages, entries),
             max_request_header_bytes=largest_headers.total_bytes if largest_headers else 0,
             max_request_header_note=largest_headers.describe() if largest_headers else "",
             error_body_count=sum(bool(response_body_text(e)) for e in error_responses),
@@ -2132,6 +2691,37 @@ class HarAnalyzer:
         )
         report.key_findings = self._generate_key_findings(report)
         return report
+
+    def _page_summaries(self, pages: list[HarPage], entries: list[HarEntry]) -> list[PageSummary]:
+        """Each page's milestones plus the requests that belong to it (by ``pageref``)."""
+        by_page: dict[str, list[HarEntry]] = defaultdict(list)
+        for entry in entries:
+            if entry.pageref:
+                by_page[entry.pageref].append(entry)
+        summaries: list[PageSummary] = []
+        for page in pages:
+            members = by_page.get(page.id, [])
+            last_end = -1.0
+            if page.started_date_time is not None:
+                ends = [
+                    (entry_end_time(e) - page.started_date_time).total_seconds() * 1000
+                    for e in members
+                    if e.time >= 0
+                ]
+                last_end = max(ends, default=-1.0)
+            summaries.append(
+                PageSummary(
+                    page_id=page.id,
+                    title=page.title,
+                    started=page.started_date_time,
+                    dom_content_loaded_ms=page.page_timings.on_content_load,
+                    load_ms=page.page_timings.on_load,
+                    request_count=len(members),
+                    failed_count=sum(self.is_problem(e) for e in members),
+                    last_response_end_ms=last_end,
+                )
+            )
+        return summaries
 
     def _phase_stats(self, measured: list[HarEntry]) -> dict[str, TimingStatistics]:
         """Per-phase statistics over recorded (>= 0) values of network-answered requests."""
@@ -2228,7 +2818,7 @@ class HarAnalyzer:
         phase_stats: dict[str, TimingStatistics],
     ) -> list[PhaseBreakdown]:
         """Share of summed phase time per phase (connect excludes TLS, so no double count)."""
-        display_names = {"TTFB": "Wait / TTFB", "SSL": "TLS", "Blocked": "Queued in browser"}
+        display_names = PHASE_DISPLAY_NAMES
         phase_totals = {
             display_names.get(name, name): stats.total_duration_ms
             for name, stats in phase_stats.items()
@@ -2303,7 +2893,7 @@ class HarAnalyzer:
                     domain=domain,
                     total_requests=total,
                     failed_requests=problems,
-                    error_rate=error_rate,
+                    failure_rate_pct=error_rate,
                     timing_stats=self._compute_timing_stats([e.time for e in measured]),
                     status_codes=dict(status_dist),
                     issue_count=issue_counts.get(domain, 0),
@@ -2329,7 +2919,7 @@ class HarAnalyzer:
         }
         return sorted(
             domain_analyses,
-            key=lambda d: (health_order[d.health], -d.error_rate, d.domain),
+            key=lambda d: (health_order[d.health], -d.failure_rate_pct, d.domain),
         )
 
     @staticmethod
@@ -2360,9 +2950,7 @@ class HarAnalyzer:
     def _compute_timing_stats(self, values: list[float]) -> TimingStatistics:
         """Compute interpolated percentile statistics."""
         if not values:
-            return TimingStatistics(
-                count=0, p50=0, p95=0, p99=0, max=0, mean=0, total_duration_ms=0
-            )
+            return TimingStatistics()
 
         sorted_values = sorted(values)
         return TimingStatistics(
@@ -2464,7 +3052,13 @@ class HarAnalyzer:
                 )
             )
 
-        return sorted(endpoints, key=lambda e: (-tail_value(e.timings), e.url_pattern, e.method))
+        # Ranked by tail wait (TTFB) of non-5xx responses: the measure the slow-endpoint
+        # rule uses. Queueing in the browser is not the server's time, and failures are
+        # reported as failures.
+        return sorted(
+            endpoints,
+            key=lambda e: (-tail_value(e.served_wait_timings), e.url_pattern, e.method),
+        )
 
     # -------------------------------------------------------------------------
     # Issue detection
@@ -2603,15 +3197,18 @@ class HarAnalyzer:
                 where = "phase split unavailable"
             else:
                 phase_name, phase_ms = dominant
-                where = f"largest recorded phase: {descriptions[phase_name]} {phase_ms / 1000:.1f}s"
+                where = (
+                    f"largest recorded phase: {descriptions[phase_name]} "
+                    f"{format_duration_ms(phase_ms)}"
+                )
             issues.append(
                 DetectedIssue(
                     issue_type=IssueType.DURATION_EXCEEDED,
                     severity=IssueSeverity.HIGH,
                     url=entry.request.url,
                     message=(
-                        f"Request exceeded {threshold_ms / 1000:g}s threshold "
-                        f"({entry.time / 1000:.1f}s; {where})"
+                        f"Request exceeded {format_duration_ms(threshold_ms)} threshold "
+                        f"({format_duration_ms(entry.time)}; {where})"
                     ),
                     duration_ms=entry.time if entry.time >= 0 else None,
                     timestamp=entry.started_date_time,
@@ -2622,7 +3219,7 @@ class HarAnalyzer:
                         "dominant_phase": dominant[0] if dominant else "unknown",
                         "threshold_ms": threshold_ms,
                         "group_label": (
-                            f"Request exceeded {threshold_ms / 1000:g}s threshold "
+                            f"Request exceeded {format_duration_ms(threshold_ms)} threshold "
                             f"({where.split(':', 1)[0]})"
                         ),
                     },
@@ -2670,8 +3267,8 @@ class HarAnalyzer:
                 details["request_headers"] = header_size.describe()
                 details["request_headers_over_limit"] = True
             rejected_body_size = (
-                entry.request.body_size
-                if status == HTTP_STATUS_PAYLOAD_TOO_LARGE and entry.request.body_size > 0
+                entry.request.body_bytes
+                if status == HTTP_STATUS_PAYLOAD_TOO_LARGE and entry.request.body_bytes > 0
                 else None
             )
             if rejected_body_size is not None:
@@ -2698,22 +3295,22 @@ class HarAnalyzer:
         """Detect large responses by uncompressed size (``content.size``, else wire size)."""
         issues: list[DetectedIssue] = []
         for entry in entries:
-            uncompressed_bytes = response_uncompressed_bytes(entry)
+            uncompressed_bytes = decoded_body_bytes(entry)
             if uncompressed_bytes <= self.settings.large_payload_bytes:
                 continue
-            wire_bytes = self.transferred_bytes(entry)
+            wire_bytes = self.wire_bytes(entry)
             issues.append(
                 DetectedIssue(
                     issue_type=IssueType.LARGE_PAYLOAD,
                     severity=IssueSeverity.MEDIUM,
                     url=entry.request.url,
-                    message=f"Large payload: {uncompressed_bytes / ONE_MEGABYTE:.1f} MB",
+                    message=f"Large payload: {format_bytes(uncompressed_bytes)}",
                     size_bytes=uncompressed_bytes,
                     timestamp=entry.started_date_time,
                     details={
                         "content_type": self._get_content_type(entry),
                         "bytes_on_wire": wire_bytes,
-                        "browser_cache_hit": self.is_browser_cache_hit(entry),
+                        "served_locally": self.is_served_locally(entry),
                     },
                     domain=urlparse(entry.request.url).netloc,
                 )
@@ -2741,10 +3338,11 @@ class HarAnalyzer:
                     severity=IssueSeverity.HIGH,
                     url=endpoint.url_pattern,
                     message=(
-                        f"Slow endpoint: wait {label}={value:.0f}ms "
-                        f"(wait p50={waits.p50:.0f}ms, n={waits.count} non-5xx responses; "
+                        f"Slow endpoint: wait {label}={format_duration_ms(value)} "
+                        f"(wait p50={format_duration_ms(known_ms(waits.p50))}, n={waits.count} "
+                        "non-5xx responses; "
                         f"total incl. browser queueing {tail_label(endpoint.timings)}="
-                        f"{tail_value(endpoint.timings):.0f}ms)"
+                        f"{format_duration_ms(tail_value(endpoint.timings))})"
                     ),
                     duration_ms=value,
                     timestamp=endpoint.last_seen,
@@ -2779,7 +3377,7 @@ class HarAnalyzer:
             key=lambda e: (-e.time, e.started_date_time),
         )
         return "; ".join(
-            f"{e.request.method} {self.path_template(e.request.url)} ({e.time / 1000:.1f}s)"
+            f"{e.request.method} {self.path_template(e.request.url)} ({format_duration_ms(e.time)})"
             for e in holders[: self.QUEUE_HOLDER_LIMIT]
         )
 
@@ -2797,7 +3395,7 @@ class HarAnalyzer:
             details: dict[str, object] = {
                 "phase": "blocked",
                 "method": entry.request.method,
-                "http_version": entry.request.http_version or "unknown",
+                "http_version": entry.http_version or "unknown",
             }
             holders = self._queue_holders(entry, by_domain[domain])
             if holders:
@@ -2807,7 +3405,7 @@ class HarAnalyzer:
                     issue_type=IssueType.BLOCKING,
                     severity=IssueSeverity.MEDIUM,
                     url=entry.request.url,
-                    message=f"Queued in the browser: {entry.timings.blocked / 1000:.1f}s",
+                    message=f"Queued in the browser: {format_duration_ms(entry.timings.blocked)}",
                     duration_ms=entry.timings.blocked,
                     timestamp=entry.started_date_time,
                     details=details,
@@ -2891,7 +3489,9 @@ class HarAnalyzer:
                     issue_type=issue_type,
                     severity=IssueSeverity.HIGH if is_loop else IssueSeverity.LOW,
                     url=start.request.url,
-                    message=f"{kind}: {len(redirect_hops)} hop(s) over {chain_ms:.0f}ms",
+                    message=(
+                        f"{kind}: {len(redirect_hops)} hop(s) over {format_duration_ms(chain_ms)}"
+                    ),
                     duration_ms=chain_ms,
                     timestamp=start.started_date_time,
                     details={
@@ -2997,8 +3597,6 @@ class HarAnalyzer:
         median_s = median_ms / 1000
         if median_ms <= 0:
             return None
-        # Keep the existing field, but report the observed median, not a guessed setting.
-        round_value_s = median_s
 
         status_codes: dict[int, int] = defaultdict(int)
         endpoint_counts: dict[str, int] = defaultdict(int)
@@ -3027,7 +3625,6 @@ class HarAnalyzer:
             min_ms=min(durations),
             max_ms=max(durations),
             median_ms=median_ms,
-            round_value_s=round_value_s,
             status_codes=dict(sorted(status_codes.items())),
             endpoints=dict(sorted(endpoint_counts.items(), key=lambda kv: (-kv[1], kv[0]))),
             first_seen=min(m.started_date_time for m in members),
@@ -3159,7 +3756,12 @@ class HarAnalyzer:
         """Count HTTP version distribution across all requests."""
         distribution: dict[str, int] = defaultdict(int)
         for entry in entries:
-            version = entry.request.http_version or "unknown"
+            if entry.http_version:
+                version = entry.http_version
+            elif entry.response.status == 0:
+                version = "none (no response)"
+            else:
+                version = "not recorded"
             distribution[version] += 1
         # Sort by count descending, then alphabetically
         return dict(sorted(distribution.items(), key=lambda kv: (-kv[1], kv[0])))
@@ -3167,19 +3769,23 @@ class HarAnalyzer:
     def _compute_large_request_bodies(
         self, entries: list[HarEntry], limit: int = 20
     ) -> list[LargeRequestBody]:
-        """Find requests with large body sizes (POST/PUT payloads >100KB)."""
+        """Requests whose body exceeds the large-request-body threshold, largest first."""
         large_bodies: list[LargeRequestBody] = []
 
         for entry in entries:
-            if entry.request.body_size > self.settings.large_request_body_bytes:
-                content_type = "unknown"
+            body_bytes = entry.request.body_bytes
+            if body_bytes > self.settings.large_request_body_bytes:
+                content_type = next(
+                    (h.value for h in entry.request.headers if h.name.lower() == "content-type"),
+                    "unknown",
+                )
                 if entry.request.post_data:
-                    content_type = entry.request.post_data.mime_type
+                    content_type = entry.request.post_data.mime_type or content_type
 
                 note = ""
                 if (
                     content_type.lower().startswith(FORM_URLENCODED)
-                    and entry.request.body_size > TOMCAT_MAX_POST_SIZE_BYTES
+                    and body_bytes > TOMCAT_MAX_POST_SIZE_BYTES
                 ):
                     note = (
                         "form body over Tomcat's default maxPostSize (2 MiB), which "
@@ -3194,7 +3800,7 @@ class HarAnalyzer:
                     LargeRequestBody(
                         url=entry.request.url,
                         method=entry.request.method,
-                        body_size_bytes=entry.request.body_size,
+                        body_size_bytes=body_bytes,
                         content_type=content_type,
                         timestamp=entry.started_date_time,
                         status=entry.response.status,
@@ -3313,7 +3919,7 @@ class HarAnalyzer:
             outcome = self.outcome(entry)
             if outcome == RequestOutcome.SERVER_ERROR:
                 errors[(domain, entry.response.status)].append(entry)
-            elif outcome == RequestOutcome.SUCCESS and not self.is_browser_cache_hit(entry):
+            elif outcome == RequestOutcome.SUCCESS and not self.is_served_locally(entry):
                 host_successes[domain].append(entry)
                 endpoint_successes[
                     domain, entry.request.method.upper(), self.path_template(entry.request.url)
@@ -3472,7 +4078,7 @@ class HarAnalyzer:
         """Read a captured response hint only when there is network-response evidence."""
         if (
             entry.response.status == 0
-            or self.is_browser_cache_hit(entry)
+            or self.is_served_locally(entry)
             or self.is_cache_source_unknown(entry)
         ):
             return ""
@@ -3607,7 +4213,7 @@ class HarAnalyzer:
                 and self._is_login_path(urlsplit(urljoin(entry.request.url, target)).path)
                 and domain in first_app_response
                 and first_app_response[domain] <= entry.started_date_time
-                and not self.is_browser_cache_hit(entry)
+                and not self.is_served_locally(entry)
             ):
                 gap_seconds = (
                     max((entry.started_date_time - last_end[domain]).total_seconds(), 0.0)
@@ -3629,7 +4235,7 @@ class HarAnalyzer:
                 and HTTP_STATUS_OK <= entry.response.status < HTTP_STATUS_MULTIPLE_CHOICES
                 and not self._is_login_path(path)
                 and not _is_static_path(path)
-                and not self.is_browser_cache_hit(entry)
+                and not self.is_served_locally(entry)
                 and not self.is_cache_source_unknown(entry)
             ):
                 first_byte_at = response_headers_time(entry)
@@ -3650,7 +4256,7 @@ class HarAnalyzer:
             (response_headers_time(entry) or entry_end_time(entry), entry, updates)
             for entry in entries
             if entry.response.status
-            and not self.is_browser_cache_hit(entry)
+            and not self.is_served_locally(entry)
             and (updates := _session_cookie_updates(entry))
         ]
         events: list[SessionEvent] = []
@@ -3767,9 +4373,7 @@ class HarAnalyzer:
                             connection_count=(
                                 len(connections) if all(m.connection for m in members) else None
                             ),
-                            http_versions=sorted(
-                                {m.request.http_version or "unknown" for m in members}
-                            ),
+                            http_versions=sorted({m.http_version or "unknown" for m in members}),
                         )
                     )
                     start_index = end_index + 1
@@ -3951,8 +4555,8 @@ class HarAnalyzer:
                 continue
             text = (
                 f"{cluster.endpoints[cluster_key]} of them took "
-                f"~{cluster.median_ms / 1000:.2f}s ({cluster.basis}; range "
-                f"{cluster.min_ms / 1000:.2f}-{cluster.max_ms / 1000:.2f}s)"
+                f"~{format_duration_ms(cluster.median_ms)} ({cluster.basis}; range "
+                f"{format_duration_ms(cluster.min_ms)} to {format_duration_ms(cluster.max_ms)})"
             )
             if cluster.matching_settings:
                 text += (
@@ -3965,7 +4569,7 @@ class HarAnalyzer:
 
     @staticmethod
     def _largest_headers_over_limit(members: list[HarEntry]) -> RequestHeaderSize | None:
-        """The largest request header block when a size-related 4xx met the 8 KB limits."""
+        """The largest request header block when a size-related 4xx met the 8 KiB limits."""
         if members[0].response.status not in HEADER_SIZE_STATUSES:
             return None
         sizes = [size for m in members if (size := request_header_size(m)) is not None]
@@ -4026,7 +4630,7 @@ class HarAnalyzer:
             evidence.append(
                 f"request headers {largest_headers.describe()}; {REQUEST_HEADER_LIMIT_NOTE}"
             )
-        largest_body = max(m.request.body_size for m in members)
+        largest_body = max(m.request.body_bytes for m in members)
         if status == HTTP_STATUS_PAYLOAD_TOO_LARGE and largest_body > 0:
             evidence.append(f"largest request body {format_bytes(largest_body)}")
 
@@ -4288,13 +4892,13 @@ class HarAnalyzer:
         total_analyzed = 0
 
         for entry in entries:
-            body_size = response_uncompressed_bytes(entry)
-            if body_size <= 0 or self.is_browser_cache_hit(entry):
+            body_size = decoded_body_bytes(entry)
+            if body_size <= 0 or self.is_served_locally(entry):
                 continue
             total_analyzed += 1
-            content_encoding = (response_header(entry, "content-encoding") or "").lower().strip()
-            if content_encoding and content_encoding != "identity":
-                encoding_counts[content_encoding] += 1
+            encoding = content_encoding(entry)
+            if encoding != "identity":
+                encoding_counts[encoding] += 1
                 continue
             encoding_counts["none"] += 1
             content_type = response_content_type(entry)
@@ -4319,8 +4923,6 @@ class HarAnalyzer:
     # -------------------------------------------------------------------------
     # Cache Analysis
     # -------------------------------------------------------------------------
-
-    HTTP_STATUS_NOT_MODIFIED = 304
 
     def _analyze_caching(self, entries: list[HarEntry]) -> CacheAnalysis | None:
         """Analyze caching of GET requests answered 200 or 304.
@@ -4352,12 +4954,12 @@ class HarAnalyzer:
                 e
                 for e in url_entries
                 if e.response.status == HTTP_STATUS_OK
-                and not self.is_browser_cache_hit(e)
+                and not self.is_served_locally(e)
                 and not self.is_cache_source_unknown(e)
             ]
             unknown_cache_count += sum(self.is_cache_source_unknown(e) for e in url_entries)
             status_304_count = sum(
-                1 for e in url_entries if e.response.status == self.HTTP_STATUS_NOT_MODIFIED
+                1 for e in url_entries if e.response.status == HTTP_STATUS_NOT_MODIFIED
             )
             not_modified_count += status_304_count
             browser_cache_hit_count += len(browser_hits)
@@ -4377,7 +4979,7 @@ class HarAnalyzer:
                     {
                         "url": url,
                         "count": len(network_200s),
-                        "total_bytes": sum(self.transferred_bytes(e) for e in network_200s),
+                        "total_bytes": sum(max(self.wire_bytes(e), 0) for e in network_200s),
                     }
                 )
             if network_200s and _is_static_url(url) and not all(cache_controls):
@@ -4636,8 +5238,8 @@ class HarAnalyzer:
                     severity=IssueSeverity.HIGH if is_strong else IssueSeverity.MEDIUM,
                     summary=(
                         f"{cluster.request_count} requests had similar durations "
-                        f"({cluster.basis}): {cluster.min_ms / 1000:.2f}-"
-                        f"{cluster.max_ms / 1000:.2f}s ({statuses}); {evidence}"
+                        f"({cluster.basis}): {format_duration_ms(cluster.min_ms)} to "
+                        f"{format_duration_ms(cluster.max_ms)} ({statuses}); {evidence}"
                     ),
                     recommendation=(
                         comparison + " Check upstream timing and error logs. Browser wait and "
@@ -4728,10 +5330,11 @@ class HarAnalyzer:
                     summary=(
                         f"{stall.request_count} requests to {stall.domain} on "
                         f"{stall.endpoint_count} endpoints, sent at different times, all got "
-                        f"their first byte within {stall.release_spread_ms:.0f}ms of each other "
-                        f"after waiting {stall.min_wait_ms / 1000:.1f}-"
-                        f"{stall.max_wait_ms / 1000:.1f}s (host median wait "
-                        f"{stall.host_median_wait_ms:.0f}ms)"
+                        "their first byte within "
+                        f"{format_duration_ms(stall.release_spread_ms)} of each other "
+                        f"after waiting {format_duration_ms(stall.min_wait_ms)} to "
+                        f"{format_duration_ms(stall.max_wait_ms)} (host median wait "
+                        f"{format_duration_ms(stall.host_median_wait_ms)})"
                     ),
                     recommendation=(
                         "Responses arriving together suggest a shared delay. Possible causes "
@@ -4977,8 +5580,8 @@ class HarAnalyzer:
                     severity=IssueSeverity.MEDIUM,
                     summary=(
                         f"{len(issues)} request(s) to {domain} queued in the browser for "
-                        f"over {self.settings.blocking_ms:g}ms "
-                        f"(longest {(worst.duration_ms or 0.0) / 1000:.1f}s)"
+                        f"over {format_duration_ms(self.settings.blocking_ms)} "
+                        f"(longest {format_duration_ms(worst.duration_ms or 0.0)})"
                     ),
                     recommendation=(
                         f"{cause}; in flight during the longest queue: {holders}"
@@ -5007,9 +5610,9 @@ class HarAnalyzer:
                 category="slowest_server_time",
                 severity=IssueSeverity.HIGH if is_slow else IssueSeverity.LOW,
                 summary=(
-                    "Slowest wait for first byte (TTFB) among non-5xx responses: "
+                    "Slowest wait (TTFB) among non-5xx responses: "
                     f"{slowest.method} {urlparse(slowest.url_pattern).path} "
-                    f"{tail_label(slowest.served_wait_timings)} {value:.0f}ms "
+                    f"{tail_label(slowest.served_wait_timings)} {format_duration_ms(value)} "
                     f"(n={slowest.served_wait_timings.count})"
                 ),
                 recommendation=(
@@ -5020,7 +5623,10 @@ class HarAnalyzer:
                     "inspect thread/dependency pools and JVM evidence "
                     "if server latency is confirmed"
                     if is_slow
-                    else f"Below the {self.settings.slow_endpoint_ms:g}ms slow threshold"
+                    else (
+                        "Below the "
+                        f"{format_duration_ms(self.settings.slow_endpoint_ms)} slow threshold"
+                    )
                 ),
             )
         ]
@@ -5038,7 +5644,8 @@ class HarAnalyzer:
                     severity=IssueSeverity.MEDIUM,
                     summary=(
                         f"DNS resolution {tail_label(report.dns_timings)} "
-                        f"{tail_value(report.dns_timings):.0f}ms (n={report.dns_timings.count})"
+                        f"{format_duration_ms(tail_value(report.dns_timings))} "
+                        f"(n={report.dns_timings.count})"
                     ),
                     recommendation="Consider DNS prefetching or preconnect hints",
                     frontend=True,
@@ -5067,14 +5674,14 @@ class HarAnalyzer:
 
         comp = report.compression_analysis
         if comp and comp.compressible_uncompressed_count > 0:
-            size_mb = comp.compressible_uncompressed_bytes / ONE_MEGABYTE
             findings.append(
                 KeyFinding(
                     category="compression",
                     severity=IssueSeverity.MEDIUM,
                     summary=(
                         f"{comp.compressible_uncompressed_count} response(s) "
-                        f"({size_mb:.1f} MB) could benefit from compression"
+                        f"({format_bytes(comp.compressible_uncompressed_bytes)}) could "
+                        "benefit from compression"
                     ),
                     recommendation=(
                         "Enable compression on the tier that serves these responses. On a "
@@ -5091,14 +5698,14 @@ class HarAnalyzer:
             r for r in (cache.repeated_downloads if cache else []) if _is_static_url(str(r["url"]))
         ]
         if repeated_static:
-            wasted_mb = sum(r["total_bytes"] for r in repeated_static) / ONE_MEGABYTE
+            wasted_bytes = sum(r["total_bytes"] for r in repeated_static)
             findings.append(
                 KeyFinding(
                     category="caching",
                     severity=IssueSeverity.MEDIUM,
                     summary=(
                         f"{len(repeated_static)} static URL(s) fetched repeatedly over "
-                        f"the network with no cache hit or 304 ({wasted_mb:.1f} MB)"
+                        f"the network with no cache hit or 304 ({format_bytes(wasted_bytes)})"
                     ),
                     recommendation=(
                         "Add Cache-Control (and validators) on the tier that serves these "
@@ -5137,11 +5744,11 @@ class HarAnalyzer:
                     category="domain_health",
                     severity=IssueSeverity.CRITICAL,
                     summary=(
-                        f"{len(critical_domains)} domain(s) had a critical problem rate "
+                        f"{len(critical_domains)} host(s) had a critical failure rate "
                         "in this capture: "
                         f"{', '.join(critical_domains)}"
                     ),
-                    recommendation="Review the response and browser error counts for these domains",
+                    recommendation="Review the response and network error counts for these hosts",
                 )
             )
 
@@ -5183,7 +5790,7 @@ class HarAnalyzer:
                     summary=(
                         f"{total_burst_errors} errors on several endpoints failed together in "
                         f"{len(shared_runs)} run(s) (each failing within "
-                        f"{self.ERROR_BURST_WINDOW_MS / 1000:g}s of the previous) "
+                        f"{format_duration_ms(self.ERROR_BURST_WINDOW_MS)} of the previous) "
                         f"affecting {', '.join(all_domains)}"
                     ),
                     recommendation=(
@@ -5247,7 +5854,7 @@ class HarAnalyzer:
         }
         # Waiting on the server side dominating is the normal state for API traffic; a
         # network phase dominating is not.
-        phase_labels = {"TTFB": "Wait (TTFB)", "Blocked": "Queueing in the browser", "SSL": "TLS"}
+        phase_labels = PHASE_DISPLAY_NAMES
         return [
             KeyFinding(
                 category="bottleneck",
@@ -5311,15 +5918,8 @@ def _format_bucket(seconds: int) -> str:
 
 
 def _format_duration(td: timedelta) -> str:
-    """Format a timedelta as human-readable duration (e.g. '2m 34s', '1h 5m 12s')."""
-    total_seconds = td.total_seconds()
-    if total_seconds < _SECONDS_PER_MINUTE:
-        return f"{total_seconds:.1f}s"
-    minutes, seconds = divmod(int(total_seconds), _SECONDS_PER_MINUTE)
-    hours, minutes = divmod(minutes, _SECONDS_PER_MINUTE)
-    if hours:
-        return f"{hours}h {minutes}m {seconds}s"
-    return f"{minutes}m {seconds}s"
+    """A timedelta in the one duration style (see ``format_duration_ms``)."""
+    return format_duration_ms(td.total_seconds() * 1000)
 
 
 DOMAIN_TABLE_MAX_ROWS = 20
@@ -5344,11 +5944,7 @@ SERVER_SOFTWARE_MAX_DOMAINS = 10
 # Path truncation limits for display
 PATH_TRUNCATE_LONG = 80
 PATH_TRUNCATE_MEDIUM = 60
-PATH_TRUNCATE_SHORT = 50
-PATH_TRUNCATE_TINY = 40
 
-# Byte size thresholds
-ONE_MEGABYTE = 1_048_576
 
 CONNECTION_REUSE_UNAVAILABLE_MSG = "Not available: HAR has no connection IDs"
 
@@ -5357,19 +5953,19 @@ def format_percentiles(stats: TimingStatistics) -> str:
     """Percentiles the sample size supports: p95 needs n >= 20, p99 needs n >= 100."""
     if stats.count == 0:
         return "no data (n=0)"
-    if stats.count < MIN_SAMPLES_FOR_TAIL_PERCENTILES:
-        return (
-            f"p50 {stats.p50:.0f}ms / max {stats.max:.0f}ms "
-            f"(n={stats.count}; p95/p99 need n≥{MIN_SAMPLES_FOR_TAIL_PERCENTILES})"
-        )
-    if stats.count < MIN_SAMPLES_FOR_P99:
-        return (
-            f"p50 {stats.p50:.0f}ms / p95 {stats.p95:.0f}ms / max {stats.max:.0f}ms "
-            f"(n={stats.count}; p99 needs n≥{MIN_SAMPLES_FOR_P99})"
-        )
-    return (
-        f"p50 {stats.p50:.0f}ms / p95 {stats.p95:.0f}ms / p99 {stats.p99:.0f}ms (n={stats.count})"
+    parts = [f"p50 {format_duration_ms(known_ms(stats.p50))}"]
+    if stats.count >= MIN_SAMPLES_FOR_TAIL_PERCENTILES:
+        parts.append(f"p95 {format_duration_ms(known_ms(stats.p95))}")
+    if stats.count >= MIN_SAMPLES_FOR_P99:
+        parts.append(f"p99 {format_duration_ms(known_ms(stats.p99))}")
+        return f"{' / '.join(parts)} (n={stats.count})"
+    parts.append(f"max {format_duration_ms(known_ms(stats.max))}")
+    needs = (
+        f"p95/p99 need n≥{MIN_SAMPLES_FOR_TAIL_PERCENTILES}"
+        if stats.count < MIN_SAMPLES_FOR_TAIL_PERCENTILES
+        else f"p99 needs n≥{MIN_SAMPLES_FOR_P99}"
     )
+    return f"{' / '.join(parts)} (n={stats.count}; {needs})"
 
 
 def md_cell(text: str) -> str:
@@ -5387,11 +5983,57 @@ def md_table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> list[str]
     return lines
 
 
+_BINARY_UNITS = ("KiB", "MiB", "GiB", "TiB")
+_MS_PER_SECOND = 1000.0
+_MS_PER_MINUTE = 60_000.0
+_MINUTES_PER_HOUR = 60
+
+
 def format_bytes(size_bytes: float) -> str:
-    """``1.5 MB`` / ``200.0 KB``."""
-    if size_bytes >= ONE_MEGABYTE:
-        return f"{size_bytes / ONE_MEGABYTE:.1f} MB"
-    return f"{size_bytes / 1024:.1f} KB"
+    """``512 B``, ``1.5 KiB``, ``200.0 MiB`` (1024-based); ``unknown`` when negative.
+
+    A non-zero size never prints as zero: anything below 1 KiB is shown in bytes.
+    """
+    if size_bytes < 0:
+        return "unknown"
+    if size_bytes < 1024:  # noqa: PLR2004 - one KiB
+        return f"{size_bytes:,.0f} B"
+    value = float(size_bytes) / 1024
+    unit_index = 0
+    while value >= 1024 and unit_index < len(_BINARY_UNITS) - 1:  # noqa: PLR2004 - next unit
+        value /= 1024
+        unit_index += 1
+    return f"{value:,.1f} {_BINARY_UNITS[unit_index]}"
+
+
+def format_duration_ms(milliseconds: float) -> str:
+    """One duration style everywhere: ``<1 ms``, ``250 ms``, ``1.51 s``, ``2 min 5 s``.
+
+    Precision is 1 ms below one second and 10 ms up to a minute (trailing zeros
+    dropped); a non-zero duration never prints as zero. ``-`` when not recorded.
+    """
+    if milliseconds < 0:
+        return "-"
+    if milliseconds == 0:
+        return "0 ms"
+    if milliseconds < 1:
+        return "<1 ms"
+    if round(milliseconds) < _MS_PER_SECOND:
+        return f"{milliseconds:.0f} ms"
+    if round(milliseconds, -1) < _MS_PER_MINUTE:
+        seconds = f"{milliseconds / _MS_PER_SECOND:.2f}".rstrip("0").rstrip(".")
+        return f"{seconds} s"
+    return _format_minutes(milliseconds)
+
+
+def _format_minutes(milliseconds: float) -> str:
+    """``1 min 0.4 s`` (10 ms precision) below an hour, ``2 h 5 min`` above."""
+    minutes, rest_ms = divmod(round(milliseconds, -1), _MS_PER_MINUTE)
+    if minutes < _MINUTES_PER_HOUR:
+        seconds = f"{rest_ms / _MS_PER_SECOND:.2f}".rstrip("0").rstrip(".")
+        return f"{minutes:.0f} min {seconds} s"
+    hours, minutes = divmod(minutes, _MINUTES_PER_HOUR)
+    return f"{hours:.0f} h {minutes:.0f} min"
 
 
 def write_text_atomic(path: Path, text: str) -> None:
@@ -5418,7 +6060,7 @@ def format_tail(stats: TimingStatistics) -> str:
     """Table cell for a tail latency: ``1234ms (p95, n=40)`` or ``900ms (max, n=3)``."""
     if stats.count == 0:
         return "-"
-    return f"{tail_value(stats):.0f}ms ({tail_label(stats)}, n={stats.count})"
+    return f"{format_duration_ms(tail_value(stats))} ({tail_label(stats)}, n={stats.count})"
 
 
 def describe_thresholds(settings: AnalyzerSettings) -> list[str]:
@@ -5426,14 +6068,14 @@ def describe_thresholds(settings: AnalyzerSettings) -> list[str]:
     expected = ", ".join(f"`{rule}`" for rule in settings.expected_rules) or "none"
     lines = [
         (
-            f"slow endpoint: wait for first byte > {settings.slow_endpoint_ms:g}ms "
+            f"slow endpoint: wait for first byte > {format_duration_ms(settings.slow_endpoint_ms)} "
             "(p95; max when n<20; non-5xx responses)"
         ),
-        f"request duration > {settings.duration_exceeded_ms:g}ms",
-        f"idle gap > {settings.idle_gap_ms:g}ms with nothing in flight",
-        f"client blocking > {settings.blocking_ms:g}ms",
-        f"large response > {settings.large_payload_bytes:,} bytes",
-        f"large request body > {settings.large_request_body_bytes:,} bytes",
+        f"request duration > {format_duration_ms(settings.duration_exceeded_ms)}",
+        f"idle gap > {format_duration_ms(settings.idle_gap_ms)} with nothing in flight",
+        f"client blocking > {format_duration_ms(settings.blocking_ms)}",
+        f"large response > {format_bytes(settings.large_payload_bytes)} (decoded body)",
+        f"large request body > {format_bytes(settings.large_request_body_bytes)}",
         f"redirect chain ≥ {settings.redirect_chain_min_hops} hops",
         (
             f"timeout cluster ≥ {settings.timeout_cluster_min_requests} requests with "
@@ -5540,6 +6182,7 @@ class OutputFormatter:
             console.print()
 
         for section in (
+            self._pages_section(report),
             *self._infrastructure_sections(report),
             self._time_gap_section(report),
             self._large_request_body_section(report),
@@ -5625,13 +6268,13 @@ class OutputFormatter:
 
         backend_error_issues = self._filter_backend_error_issues(report.issues)
         if backend_error_issues:
-            self._print_issues_by_domain(backend_error_issues, title="Backend/API Errors by Domain")
+            self._print_issues_by_domain(backend_error_issues, title="Backend/API Errors by Host")
             console.print()
 
         backend_perf_issues = self._filter_backend_perf_issues(report.issues)
         if backend_perf_issues:
             self._print_issues_by_domain(
-                backend_perf_issues, title="Backend/API Performance Issues by Domain"
+                backend_perf_issues, title="Backend/API Performance Issues by Host"
             )
             console.print()
 
@@ -5691,7 +6334,7 @@ class OutputFormatter:
                 "Total",
                 "Queued",
                 "DNS",
-                "Connect",
+                "TCP connect",
                 "TLS",
                 "Send",
                 "Wait",
@@ -5717,12 +6360,11 @@ class OutputFormatter:
 
     @staticmethod
     def seconds_range(low_ms: float, high_ms: float) -> str:
-        """``60.0-60.4s``, or one value when the two round to the same thing."""
+        """``1.51 s to 2 s``, or one value when both display the same."""
         if low_ms < 0 or high_ms < 0:
             return "-"
-        if abs(high_ms - low_ms) < 50:  # noqa: PLR2004 - below display resolution
-            return f"{high_ms / 1000:.1f}s"
-        return f"{low_ms / 1000:.1f}-{high_ms / 1000:.1f}s"
+        low, high = format_duration_ms(low_ms), format_duration_ms(high_ms)
+        return high if low == high else f"{low} to {high}"
 
     def _incident_section(self, report: HarAnalysisReport) -> ReportSection | None:
         """Failures grouped by endpoint and signature, each with evidence and next steps."""
@@ -5892,7 +6534,7 @@ class OutputFormatter:
                             str(s.request_count),
                             str(s.endpoint_count),
                             self.seconds_range(s.min_wait_ms, s.max_wait_ms),
-                            f"{s.release_spread_ms:.0f}ms",
+                            f"{format_duration_ms(s.release_spread_ms)}",
                             str(s.connection_count) if s.connection_count else "not recorded",
                             ", ".join(str(index) for index in s.entry_indexes),
                         )
@@ -5948,7 +6590,7 @@ class OutputFormatter:
                         "From",
                         "Requests",
                         "5xx",
-                        "NetErr",
+                        "Net errors",
                         "4xx",
                         "Wait p50",
                         "Wait max",
@@ -5956,13 +6598,17 @@ class OutputFormatter:
                     rows=[
                         (
                             b.domain,
-                            self._table_time(b.start, timespec="seconds"),
+                            self._table_time(b.start, timespec="milliseconds"),
                             str(b.request_count),
                             str(b.server_error_count) if b.server_error_count else "-",
                             str(b.network_error_count) if b.network_error_count else "-",
                             str(b.client_error_count) if b.client_error_count else "-",
-                            f"{b.wait_p50_ms:.0f}ms" if b.wait_p50_ms is not None else "-",
-                            f"{b.wait_max_ms:.0f}ms" if b.wait_max_ms is not None else "-",
+                            f"{format_duration_ms(b.wait_p50_ms)}"
+                            if b.wait_p50_ms is not None
+                            else "-",
+                            f"{format_duration_ms(b.wait_max_ms)}"
+                            if b.wait_max_ms is not None
+                            else "-",
                         )
                         for b in report.timeline
                     ],
@@ -5972,6 +6618,42 @@ class OutputFormatter:
         if log_correlation:
             sections.append(log_correlation)
         return sections
+
+    def _pages_section(self, report: HarAnalysisReport) -> ReportSection | None:
+        if not report.pages:
+            return None
+        rows = [
+            (
+                self._table_time(page.started) if page.started else "-",
+                self._display_detail(page.title) if page.title else page.page_id,
+                format_duration_ms(page.dom_content_loaded_ms),
+                format_duration_ms(page.load_ms),
+                str(page.request_count),
+                str(page.failed_count) if page.failed_count else "-",
+                format_duration_ms(page.last_response_end_ms),
+            )
+            for page in report.pages[:DOMAIN_TABLE_MAX_ROWS]
+        ]
+        hidden = len(report.pages) - DOMAIN_TABLE_MAX_ROWS
+        return ReportSection(
+            title="Pages",
+            note=(
+                "Milestones are measured from each page's start (browser clock). Requests "
+                "are those the capture assigned to the page. Some producers (Playwright) "
+                "record one page for a whole session."
+            ),
+            headers=(
+                "Started",
+                "Page",
+                "DOMContentLoaded",
+                "Load",
+                "Requests",
+                "Failed",
+                "Last request done",
+            ),
+            rows=rows,
+            footnotes=(f"... and {hidden} more pages",) if hidden > 0 else (),
+        )
 
     def _time_gap_section(self, report: HarAnalysisReport) -> ReportSection | None:
         if not report.time_gaps and not report.idle_gap_unknown_count:
@@ -5987,15 +6669,18 @@ class OutputFormatter:
                 "running"
             )
         return ReportSection(
-            title=f"Idle Periods (>{report.settings.idle_gap_ms:g}ms with no request in flight)",
+            title=(
+                f"Idle Periods (>{format_duration_ms(report.settings.idle_gap_ms)} "
+                "with no request in flight)"
+            ),
             note="Idle from = when the last running request ended; the next request ended the gap.",
             headers=("Idle", "Idle from", "Next request", "Next request started"),
             rows=[
                 (
-                    f"{gap.gap_duration_ms / 1000:.1f}s",
-                    self._table_time(gap.before_timestamp, timespec="seconds"),
+                    f"{format_duration_ms(gap.gap_duration_ms)}",
+                    self._table_time(gap.before_timestamp, timespec="milliseconds"),
                     self._extract_path(gap.after_url)[:PATH_TRUNCATE_LONG],
-                    self._table_time(gap.after_timestamp, timespec="seconds"),
+                    self._table_time(gap.after_timestamp, timespec="milliseconds"),
                 )
                 for gap in report.time_gaps[:TIME_GAP_TABLE_MAX_ROWS]
             ],
@@ -6069,7 +6754,9 @@ class OutputFormatter:
                             o.domain,
                             str(o.status),
                             str(o.count),
-                            f"{o.median_active_ms / 1000:.2f}s" if o.median_active_ms >= 0 else "-",
+                            f"{format_duration_ms(o.median_active_ms)}"
+                            if o.median_active_ms >= 0
+                            else "-",
                             self._counts_text(o.fingerprints),
                             self._counts_text(o.error_servers),
                             self._counts_text(o.success_servers),
@@ -6093,7 +6780,15 @@ class OutputFormatter:
                         "Counts group responses by X-Served-By. A proxy or cache can set this "
                         "header. Confirm the serving backend in deployment logs."
                     ),
-                    headers=("Host", "Hint", "Source", "Responses", "5xx", "NetErr", "Tail total"),
+                    headers=(
+                        "Host",
+                        "Hint",
+                        "Source",
+                        "Responses",
+                        "5xx",
+                        "Net errors",
+                        "Tail total",
+                    ),
                     rows=[
                         (
                             n.domain,
@@ -6238,10 +6933,11 @@ class OutputFormatter:
             "Best-effort transfer totals are a lower bound when evidence is incomplete."
         )
         if report.backend_unknown_request_count:
+            failures = report.backend_unknown_failure_count
             lines.append(
                 "Routing evidence unavailable for "
-                f"{report.backend_unknown_request_count} request(s), "
-                f"including {report.backend_unknown_failure_count} 5xx/network failures."
+                f"{report.backend_unknown_request_count} request(s)"
+                + (f", including {failures} 5xx/network failure(s)." if failures else ".")
             )
         if report.backend_ambiguous_request_count:
             lines.append(
@@ -6278,13 +6974,20 @@ class OutputFormatter:
         population = report.latency_population
         if population is None:
             return ""
-        return (
-            f"Percentiles cover the {population.measured_count:,} request(s) answered over "
-            f"the network; excluded: {population.browser_cache_hit_count:,} browser-cache "
-            f"hit(s), {population.aborted_count:,} aborted, "
-            f"{population.network_error_count:,} network error(s), "
-            f"{population.timing_unavailable_count:,} with unavailable total timing, "
-            f"{population.cache_source_unknown_count:,} with unknown cache/network source"
+        excluded = [
+            f"{count:,} {label}"
+            for count, label in (
+                (population.browser_cache_hit_count, "served by the browser cache"),
+                (population.service_worker_count, "served by a service worker"),
+                (population.aborted_count, "cancelled, blocked or not sent"),
+                (population.network_error_count, "network error(s)"),
+                (population.timing_unavailable_count, "without a recorded total time"),
+                (population.cache_source_unknown_count, "cache or network source unknown"),
+            )
+            if count
+        ]
+        return f"Percentiles cover the {population.measured_count:,} request(s) answered over " + (
+            f"the network; not included: {'; '.join(excluded)}" if excluded else "the network"
         )
 
     def _print_frontend_section(self, report: HarAnalysisReport) -> None:
@@ -6429,13 +7132,13 @@ class OutputFormatter:
     def _timing_rows(self, report: HarAnalysisReport) -> list[tuple[str, TimingStatistics]]:
         return [
             ("Overall", report.overall_timings),
-            ("Queued in browser (client)", report.blocked_timings),
-            ("DNS (network)", report.dns_timings),
-            ("Connect excl. TLS (network)", report.connect_timings),
-            ("SSL/TLS (network)", report.ssl_timings),
-            ("Send (client)", report.send_timings),
+            ("Queued (in the browser)", report.blocked_timings),
+            ("DNS", report.dns_timings),
+            ("TCP connect", report.connect_timings),
+            ("TLS", report.ssl_timings),
+            ("Send", report.send_timings),
             (self._ttfb_label(report), report.ttfb_timings),
-            ("Receive (network)", report.receive_timings),
+            ("Receive", report.receive_timings),
         ]
 
     def _response_class_lines(self, report: HarAnalysisReport) -> list[str]:
@@ -6448,16 +7151,16 @@ class OutputFormatter:
             lines.append(
                 f"expected (matched rules, not failures): {report.expected_response_count:,}"
             )
-        if report.aborted_request_count:
-            lines.append(
-                f"aborted/cancelled by browser (informational): {report.aborted_request_count:,}"
-            )
+        lines.extend(
+            f"{INFORMATIONAL_LABELS.get(category, category)} (informational): {count:,}"
+            for category, count in report.informational_by_category.items()
+        )
         if report.network_errors_by_category:
             by_type = ", ".join(
                 f"{category} {count}"
                 for category, count in report.network_errors_by_category.items()
             )
-            lines.append(f"browser errors and missing responses: {by_type}")
+            lines.append(f"network errors: {by_type}")
         return lines
 
     def _md_summary(self, report: HarAnalysisReport) -> list[str]:
@@ -6466,7 +7169,8 @@ class OutputFormatter:
         lines = ["## Summary", ""]
         lines.append(f"- **Total Requests:** {report.total_requests:,}")
         lines.append(
-            f"- **Total Duration (sum of request times):** {report.total_duration_ms / 1000:.1f}s"
+            "- **Total Duration (sum of request times):** "
+            f"{format_duration_ms(report.total_duration_ms)}"
         )
         if report.capture_start and report.capture_end:
             lines.append(
@@ -6479,8 +7183,7 @@ class OutputFormatter:
                 f"{_format_duration(report.capture_end - report.capture_start)}"
             )
         lines.append(
-            "- **Total Transferred (best-effort):** "
-            f"{report.total_bytes_transferred / 1024 / 1024:.1f} MB"
+            f"- **Total transferred (best effort):** {format_bytes(report.total_bytes_transferred)}"
         )
         lines.extend(["", "### Timing Percentiles", "", self._latency_population_line(report), ""])
         lines.extend(
@@ -6509,7 +7212,7 @@ class OutputFormatter:
             lines.append("")
             lines.extend(
                 f"- **{phase.phase_name}:** {phase.percentage_of_total:.0f}% "
-                f"({phase.total_ms:.0f}ms)"
+                f"({format_duration_ms(phase.total_ms)})"
                 for phase in report.phase_breakdown
                 if phase.percentage_of_total >= 1.0
             )
@@ -6526,22 +7229,24 @@ class OutputFormatter:
         return lines
 
     DOMAIN_HEALTH_HEADERS = (
-        "Domain",
+        "Host",
         "Requests",
         "Failures",
-        "Failure Rate",
+        "Failure rate",
         "5xx",
-        "NetErr",
+        "Net errors",
         "Expected",
-        "Aborted",
+        "Cancelled/blocked",
         "Tail total",
         "TCP connect median",
         "Most time in",
         "Status",
     )
-    DOMAIN_HEALTH_TERMINAL_HIDDEN = frozenset({"Expected", "Aborted", "TCP connect median"})
+    DOMAIN_HEALTH_TERMINAL_HIDDEN = frozenset(
+        {"Expected", "Cancelled/blocked", "TCP connect median"}
+    )
     DOMAIN_HEALTH_NOTE = (
-        "Status describes the captured requests. NetErr includes entries without an HTTP "
+        "Status describes the captured requests. Net errors include entries without an HTTP "
         "response or recorded cause. TCP connect median is observed setup time. "
         "Most time in: "
         "wait = time to first byte (round trip + proxies + application), network = DNS + "
@@ -6551,7 +7256,8 @@ class OutputFormatter:
     @staticmethod
     def _domain_health_cells(domain: DomainAnalysis) -> tuple[str, ...]:
         round_trip = (
-            f"{domain.round_trip_estimate_ms:.0f}ms (n={domain.round_trip_sample_count})"
+            f"{format_duration_ms(domain.round_trip_estimate_ms)} "
+            f"(n={domain.round_trip_sample_count})"
             if domain.round_trip_estimate_ms is not None
             else "-"
         )
@@ -6559,7 +7265,7 @@ class OutputFormatter:
             domain.domain,
             str(domain.total_requests),
             str(domain.failed_requests),
-            f"{domain.error_rate:.1f}%",
+            f"{domain.failure_rate_pct:.1f}%",
             str(domain.server_error_count),
             str(domain.network_error_count),
             str(domain.expected_count),
@@ -6575,7 +7281,7 @@ class OutputFormatter:
             return []
         return self._md_section(
             ReportSection(
-                title="Domain Health Overview",
+                title="Host Health",
                 note=self.DOMAIN_HEALTH_NOTE,
                 headers=self.DOMAIN_HEALTH_HEADERS,
                 rows=[self._domain_health_cells(domain) for domain in report.domains],
@@ -6586,11 +7292,12 @@ class OutputFormatter:
         failing = self._failing_services(report.service_failures)
         if not failing:
             return []
-        over_label = f">{report.settings.duration_exceeded_ms / 1000:g}s"
+        over_label = f">{format_duration_ms(report.settings.duration_exceeded_ms)}"
         lines = ["## Backend/API Service Health", ""]
         lines.append(
-            f"| Domain | Method | Path | Req | 1xx-3xx | Expected | Aborted | NetErr | 5xx | 4xx | "
-            f"{over_label} | ProblemRate | Tail total | Tail wait (TTFB) | Tail net |"
+            "| Host | Method | Path | Req | 1xx-3xx | Expected | Cancelled/blocked | Net errors "
+            f"| 5xx | 4xx | {over_label} | Problem rate | Tail total | Tail wait (TTFB) "
+            "| Tail net |"
         )
         lines.append(
             "|--------|--------|------|-----|----|----------|---------|--------|-----|-----|------|"
@@ -6606,7 +7313,7 @@ class OutputFormatter:
             return []
         lines = [f"## {self.OUTAGE_TITLE}", ""]
         lines.append(
-            "| Domain | Method | Path | Req | NetErr | 5xx | 4xx | First Seen | Last Seen |"
+            "| Host | Method | Path | Req | Net errors | 5xx | 4xx | First Seen | Last Seen |"
         )
         lines.append("|--------|--------|------|-----|--------|-----|-----|-----------|----------|")
         lines.extend(
@@ -6638,7 +7345,7 @@ class OutputFormatter:
         "chain": "Chain",
         "content_type": "Content type",
         "bytes_on_wire": "Bytes on wire",
-        "browser_cache_hit": "Served from browser cache",
+        "served_locally": "Served by the browser cache or a service worker",
         "may_be_in_flight_at_capture_end": "May have been in flight when the capture was saved",
         "over_duration_threshold": "Over the duration threshold",
         "timing_warnings": "Timing warnings",
@@ -6695,9 +7402,7 @@ class OutputFormatter:
         durations = [issue.duration_ms for issue in group if issue.duration_ms is not None]
         if durations:
             low, high = min(durations), max(durations)
-            lines.append(
-                f"Duration: {low:.0f}ms" if low == high else f"Duration: {low:.0f}-{high:.0f}ms"
-            )
+            lines.append(f"Duration: {self.seconds_range(low, high)}")
         entries = self._group_entries(group)
         if entries:
             lines.append(f"HAR entries: {entries}")
@@ -6754,7 +7459,7 @@ class OutputFormatter:
         lines = [
             f"- **{what}**",
             f"  - Request: `{request}`",
-            f"  - Domain: `{group[0].domain}`",
+            f"  - Host: `{group[0].domain}`",
             f"  - When (request start): `{self._group_when(group)}`",
         ]
         lines.extend(f"  - {line}" for line in self._group_detail_lines(group))
@@ -6765,7 +7470,7 @@ class OutputFormatter:
         filtered_endpoints = report.endpoints
         if not filtered_endpoints:
             return []
-        lines = ["## Top 10 Slowest Endpoints (path templates)", ""]
+        lines = [f"## {self.SLOWEST_ENDPOINTS_TITLE}", ""]
         lines.append(
             "Tail = p95 when n ≥ 20, otherwise max. IDs in paths are templated "
             "(`{uuid}`, `{n}`, `{hex}`). " + self.DOMINANT_SIDE_NOTE
@@ -6783,7 +7488,7 @@ class OutputFormatter:
             identity = f"{endpoint.method} {urlsplit(endpoint.url_pattern).netloc}{path}"
             lines.append(
                 f"| `{md_cell(identity)}` | {endpoint.count} | {format_tail(endpoint.timings)} | "
-                f"{format_tail(endpoint.ttfb_timings)} | "
+                f"{format_tail(endpoint.served_wait_timings)} | "
                 f"{format_tail(endpoint.network_total_timings)} | "
                 f"**{self._dominant_side(endpoint)}** |"
             )
@@ -6801,6 +7506,7 @@ class OutputFormatter:
         template = urlparse(endpoint.url_pattern).path
         return any(urlparse(url).path != template for url in endpoint.examples)
 
+    SLOWEST_ENDPOINTS_TITLE = "Slowest Endpoints by Wait (TTFB, non-5xx responses)"
     DOMINANT_SIDE_NOTE = (
         "Most time in: wait = time to first byte (network round trip + proxies + "
         "application); receive = body transfer or a response streamed as it is produced; "
@@ -6851,7 +7557,6 @@ class OutputFormatter:
 
     def _print_summary(self, report: HarAnalysisReport) -> None:
         hostnames = self._extract_hostnames(report)
-        total_transferred_mb = report.total_bytes_transferred / 1024 / 1024
 
         summary_lines: list[str] = ["**Hostnames:**", *[f"- {h}" for h in hostnames], ""]
         if report.capture_tool:
@@ -6864,7 +7569,8 @@ class OutputFormatter:
         summary_lines.append(f"**Total Requests:** {report.total_requests:,}")
         summary_lines.append("")
         summary_lines.append(
-            f"**Total Duration (sum of request times):** {report.total_duration_ms / 1000:.1f}s"
+            "**Total Duration (sum of request times):** "
+            f"{format_duration_ms(report.total_duration_ms)}"
         )
         summary_lines.append("")
         if report.capture_start and report.capture_end:
@@ -6882,7 +7588,9 @@ class OutputFormatter:
         if self._timestamp_timezone_label:
             summary_lines.append(f"**Timestamp Timezone:** {self._timestamp_timezone_label}")
             summary_lines.append("")
-        summary_lines.append(f"**Total Transferred (best-effort):** {total_transferred_mb:.1f} MB")
+        summary_lines.append(
+            f"**Total transferred (best effort):** {format_bytes(report.total_bytes_transferred)}"
+        )
         summary_lines.extend(
             ["", "**Timing Percentiles:**", "", self._latency_population_line(report), ""]
         )
@@ -6907,7 +7615,8 @@ class OutputFormatter:
             summary_lines.append("")
             summary_lines.append("**Phase Breakdown (share of summed phase time):**")
             summary_lines.extend(
-                f"- {phase.phase_name}: {phase.percentage_of_total:.0f}% ({phase.total_ms:.0f}ms)"
+                f"- {phase.phase_name}: {phase.percentage_of_total:.0f}% "
+                f"({format_duration_ms(phase.total_ms)})"
                 for phase in report.phase_breakdown
                 if phase.percentage_of_total >= 1.0
             )
@@ -6933,7 +7642,7 @@ class OutputFormatter:
         """What was left out of or assumed about the capture."""
         return self._capture_note_lines(report)
 
-    def format_timestamp(self, ts: datetime, *, timespec: str = "seconds") -> str:
+    def format_timestamp(self, ts: datetime, *, timespec: str = "milliseconds") -> str:
         """Format a timestamp in the configured display timezone."""
         return self._format_timestamp(ts, timespec=timespec)
 
@@ -6945,7 +7654,7 @@ class OutputFormatter:
         """Status-class counts plus expected / aborted / network error breakdown."""
         return self._response_class_lines(report)
 
-    def _format_timestamp(self, ts: datetime, *, timespec: str = "seconds") -> str:
+    def _format_timestamp(self, ts: datetime, *, timespec: str = "milliseconds") -> str:
         if self._timestamp_timezone is None:
             return ts.isoformat(timespec=timespec)
         return ts.astimezone(self._timestamp_timezone).isoformat(timespec=timespec)
@@ -6956,10 +7665,10 @@ class OutputFormatter:
         missing_ttfb_count = measured - report.ttfb_timings.count
         if missing_ttfb_count > 0:
             return (
-                "Wait / TTFB (network round trip + proxies + application; "
+                "Wait (TTFB: network round trip + proxies + application; "
                 f"{missing_ttfb_count} of {measured} had none recorded)"
             )
-        return "Wait / TTFB (network round trip + proxies + application)"
+        return "Wait (TTFB: network round trip + proxies + application)"
 
     def _format_timing_line(self, label: str, timing: TimingStatistics) -> str:
         return f"- {label}: {format_percentiles(timing)}"
@@ -6975,7 +7684,7 @@ class OutputFormatter:
     def _print_domain_health(self, report: HarAnalysisReport) -> None:
         caption = self.DOMAIN_HEALTH_NOTE
         if len(report.domains) > DOMAIN_TABLE_MAX_ROWS:
-            caption += f" ... and {len(report.domains) - DOMAIN_TABLE_MAX_ROWS} more domains"
+            caption += f" ... and {len(report.domains) - DOMAIN_TABLE_MAX_ROWS} more hosts"
         # The terminal leaves out the columns that are zero in most captures and the
         # connect median; the Markdown report has all of them.
         hidden = [
@@ -6983,11 +7692,13 @@ class OutputFormatter:
             for index, header in enumerate(self.DOMAIN_HEALTH_HEADERS)
             if header in self.DOMAIN_HEALTH_TERMINAL_HIDDEN
         ]
-        caption += " Expected, Aborted and TCP connect median are in the Markdown report (-o)."
-        table = Table(title="Domain Health Overview", caption=caption)
+        caption += (
+            " Expected, Cancelled/blocked and TCP connect median are in the Markdown report (-o)."
+        )
+        table = Table(title="Host Health", caption=caption)
         for index, header in enumerate(self.DOMAIN_HEALTH_HEADERS):
             if index not in hidden:
-                table.add_column(header, justify="left" if header == "Domain" else "right")
+                table.add_column(header, justify="left" if header == "Host" else "right")
         health_styles = {
             DomainHealth.CRITICAL: "bold red",
             DomainHealth.DEGRADED: "yellow",
@@ -7019,11 +7730,11 @@ class OutputFormatter:
             return
 
         table = Table(title=self.OUTAGE_TITLE)
-        table.add_column("Domain", style="cyan", no_wrap=False)
+        table.add_column("Host", style="cyan", no_wrap=False)
         table.add_column("Method", style="cyan", no_wrap=True)
         table.add_column("Path", style="cyan", no_wrap=False)
         table.add_column("Req", justify="right")
-        table.add_column("NetErr", justify="right", style="red")
+        table.add_column("Net errors", justify="right", style="red")
         table.add_column("5xx", justify="right", style="red")
         table.add_column("4xx", justify="right", style="yellow")
         table.add_column("First Seen", justify="right")
@@ -7038,8 +7749,8 @@ class OutputFormatter:
                 str(s.network_error_count) if s.network_error_count else "-",
                 str(s.status_5xx_count) if s.status_5xx_count else "-",
                 str(s.status_4xx_count) if s.status_4xx_count else "-",
-                self._format_timestamp(s.first_seen, timespec="seconds"),
-                self._format_timestamp(s.last_seen, timespec="seconds"),
+                self._format_timestamp(s.first_seen, timespec="milliseconds"),
+                self._format_timestamp(s.last_seen, timespec="milliseconds"),
             )
 
         self._print_table(table)
@@ -7053,18 +7764,23 @@ class OutputFormatter:
         # Aborted, total and network tails are in the Markdown report.
         table = Table(
             title="Backend/API Service Health",
-            caption="Expected, Aborted, Tail total and Tail net are in the Markdown report (-o).",
+            caption=(
+                "Expected, Cancelled/blocked, Tail total and Tail net are in the Markdown "
+                "report (-o)."
+            ),
         )
         table.add_column("Endpoint", style="cyan", no_wrap=False)
         table.add_column("Req", justify="right")
         table.add_column("1xx-3xx", justify="right", style="green")
-        table.add_column("NetErr", justify="right", style="red")
+        table.add_column("Net errors", justify="right", style="red")
         table.add_column("5xx", justify="right", style="red")
         table.add_column("4xx", justify="right", style="yellow")
         table.add_column(
-            f">{report.settings.duration_exceeded_ms / 1000:g}s", justify="right", style="red"
+            f">{format_duration_ms(report.settings.duration_exceeded_ms)}",
+            justify="right",
+            style="red",
         )
-        table.add_column("ProblemRate", justify="right", style="bold")
+        table.add_column("Problem rate", justify="right", style="bold")
         table.add_column("Tail wait (TTFB)", justify="right")
 
         for s in failing[:max_rows]:
@@ -7144,7 +7860,7 @@ class OutputFormatter:
 
         if len(sorted_domains) > ISSUES_BY_DOMAIN_MAX_DOMAINS:
             remaining_domains = len(sorted_domains) - ISSUES_BY_DOMAIN_MAX_DOMAINS
-            tree.add(f"[dim]... and {remaining_domains} more domains[/dim]")
+            tree.add(f"[dim]... and {remaining_domains} more hosts[/dim]")
 
         console.print(tree)
 
@@ -7154,7 +7870,7 @@ class OutputFormatter:
             return
 
         table = Table(
-            title="Top 10 Slowest Endpoints (path templates)",
+            title=self.SLOWEST_ENDPOINTS_TITLE,
             caption=f"Tail = p95 when n ≥ 20, otherwise max. {self.DOMINANT_SIDE_NOTE}",
         )
         table.add_column("Endpoint Template", style="cyan", no_wrap=False)
@@ -7170,7 +7886,7 @@ class OutputFormatter:
                 f"{urlparse(endpoint.url_pattern).path}",
                 str(endpoint.count),
                 format_tail(endpoint.timings),
-                format_tail(endpoint.ttfb_timings),
+                format_tail(endpoint.served_wait_timings),
                 format_tail(endpoint.network_total_timings),
                 self._dominant_side(endpoint),
             )
@@ -7220,16 +7936,6 @@ class OutputFormatter:
         info_types = {IssueType.REQUEST_ABORTED, IssueType.REDIRECT_CHAIN}
         return [i for i in issues if i.issue_type in info_types]
 
-    @staticmethod
-    def _is_static_asset(url: str) -> bool:
-        """Check if a URL points to a static asset."""
-        return _is_static_url(url)
-
-    @staticmethod
-    def _is_static_path(path: str) -> bool:
-        """Heuristic for service paths to exclude static assets."""
-        return _is_static_path(path)
-
     # -------------------------------------------------------------------------
     # Compression Analysis (Terminal)
     # -------------------------------------------------------------------------
@@ -7249,10 +7955,10 @@ class OutputFormatter:
         lines.append("")
 
         if comp.compressible_uncompressed_count > 0:
-            size_mb = comp.compressible_uncompressed_bytes / ONE_MEGABYTE
             lines.append(
                 f"**Compression Opportunities:** {comp.compressible_uncompressed_count} "
-                f"compressible response(s) sent without compression ({size_mb:.1f} MB)"
+                "compressible response(s) sent without compression "
+                f"({format_bytes(comp.compressible_uncompressed_bytes)})"
             )
         else:
             lines.append("**Compression Opportunities:** None detected")
@@ -7302,8 +8008,8 @@ class OutputFormatter:
             lines.append("**Top Repeated Downloads:**")
             for item in cache.repeated_downloads[:10]:
                 path = self._extract_path(str(item["url"]))
-                total_kb = int(item["total_bytes"]) / 1024
-                lines.append(f"- `{path}` x{item['count']} ({total_kb:.0f} KB)")
+                total = format_bytes(int(item["total_bytes"]))
+                lines.append(f"- `{path}` x{item['count']} ({total})")
 
         console.print(
             Panel(
@@ -7347,12 +8053,12 @@ class OutputFormatter:
             endpoints = ", ".join(f"{url} ({count})" for url, count in cluster.endpoints.items())
             rows.append(
                 (
-                    f"~{cluster.median_ms / 1000:.2f}s",
+                    f"~{format_duration_ms(cluster.median_ms)}",
                     cluster.basis,
                     self.TIMEOUT_CLUSTER_KINDS[cluster.kind],
                     str(cluster.request_count),
-                    f"{cluster.min_ms / 1000:.2f}-{cluster.max_ms / 1000:.2f}s",
-                    f"{cluster.max_queued_ms / 1000:.1f}s",
+                    f"{format_duration_ms(cluster.min_ms)} to {format_duration_ms(cluster.max_ms)}",
+                    f"{format_duration_ms(cluster.max_queued_ms)}",
                     statuses,
                     endpoints,
                 )
@@ -7378,7 +8084,7 @@ class OutputFormatter:
                     + ", ".join(f'"{r}" ({c})' for r, c in cluster.proxy_reasons.items())
                 )
             if lines:
-                blocks.append((f"~{cluster.median_ms / 1000:.2f}s cluster", tuple(lines)))
+                blocks.append((f"~{format_duration_ms(cluster.median_ms)} cluster", tuple(lines)))
         return tuple(blocks)
 
     def _timeout_cluster_section(self, report: HarAnalysisReport) -> ReportSection:
@@ -7411,7 +8117,7 @@ class OutputFormatter:
                         urlparse(endpoint.url_pattern).path,
                         metric,
                         format_tail(stats),
-                        f"{stats.p50:.0f}ms",
+                        f"{format_duration_ms(known_ms(stats.p50))}",
                         format_tail(endpoint.ttfb_timings),
                     )
                 )
@@ -7443,7 +8149,7 @@ class OutputFormatter:
 
     ERROR_RUN_TITLE = (
         f"Error Runs ({HarAnalyzer.ERROR_BURST_MIN_ERRORS}+ errors, each failing within "
-        f"{HarAnalyzer.ERROR_BURST_WINDOW_MS / 1000:g}s of the previous)"
+        f"{format_duration_ms(HarAnalyzer.ERROR_BURST_WINDOW_MS)} of the previous)"
     )
 
     def _print_error_bursts(self, report: HarAnalysisReport) -> None:
@@ -7456,12 +8162,12 @@ class OutputFormatter:
         table.add_column("Last failure", style="dim")
         table.add_column("Errors", justify="right", style="red")
         table.add_column("Endpoints", justify="right")
-        table.add_column("Affected Domains", style="cyan", no_wrap=False)
+        table.add_column("Affected hosts", style="cyan", no_wrap=False)
 
         for burst in report.error_bursts[:10]:
             table.add_row(
-                self._format_timestamp(burst.start_time, timespec="seconds"),
-                self._format_timestamp(burst.end_time, timespec="seconds"),
+                self._format_timestamp(burst.start_time, timespec="milliseconds"),
+                self._format_timestamp(burst.end_time, timespec="milliseconds"),
                 str(burst.error_count),
                 str(burst.endpoint_count),
                 ", ".join(burst.affected_domains),
@@ -7495,7 +8201,7 @@ class OutputFormatter:
                 lines.append(f"- `{domain}`: {server_str}")
             if len(report.server_software_by_domain) > SERVER_SOFTWARE_MAX_DOMAINS:
                 remaining = len(report.server_software_by_domain) - SERVER_SOFTWARE_MAX_DOMAINS
-                lines.append(f"- *... and {remaining} more domains*")
+                lines.append(f"- *... and {remaining} more hosts*")
             lines.append("")
 
         # Connection Reuse
@@ -7530,8 +8236,8 @@ class OutputFormatter:
         if not report.server_ips_by_domain:
             return
 
-        table = Table(title="Server IP Addresses by Domain")
-        table.add_column("Domain", style="cyan", no_wrap=False)
+        table = Table(title="Server IP Addresses by Host")
+        table.add_column("Host", style="cyan", no_wrap=False)
         table.add_column("Server IPs", style="green", no_wrap=False)
 
         for domain, ips in list(report.server_ips_by_domain.items())[:SERVER_IPS_TABLE_MAX_ROWS]:
@@ -7562,9 +8268,9 @@ class OutputFormatter:
 
         # Server Software by Domain
         if report.server_software_by_domain:
-            lines.append("### Server Software by Domain")
+            lines.append("### Server Software by Host")
             lines.append("")
-            lines.append("| Domain | Server Software |")
+            lines.append("| Host | Server Software |")
             lines.append("|--------|-----------------|")
             for domain, servers in list(report.server_software_by_domain.items())[
                 :SERVER_SOFTWARE_MAX_DOMAINS
@@ -7575,9 +8281,9 @@ class OutputFormatter:
 
         # Server IPs by Domain
         if report.server_ips_by_domain:
-            lines.append("### Server IP Addresses by Domain")
+            lines.append("### Server IP Addresses by Host")
             lines.append("")
-            lines.append("| Domain | IPs |")
+            lines.append("| Host | IPs |")
             lines.append("|--------|-----|")
             for domain, ips in list(report.server_ips_by_domain.items())[
                 :SERVER_IPS_TABLE_MAX_ROWS
@@ -7608,7 +8314,11 @@ class OutputFormatter:
         for section in self._infrastructure_sections(report):
             lines.extend(self._md_section(section, heading="###"))
 
-        for section in (self._time_gap_section(report), self._large_request_body_section(report)):
+        for section in (
+            self._pages_section(report),
+            self._time_gap_section(report),
+            self._large_request_body_section(report),
+        ):
             if section:
                 lines.extend(self._md_section(section, heading="###"))
 
@@ -7635,10 +8345,10 @@ class OutputFormatter:
         lines.append("")
 
         if comp.compressible_uncompressed_count > 0:
-            size_mb = comp.compressible_uncompressed_bytes / ONE_MEGABYTE
             lines.append(
                 f"**Compression Opportunities:** {comp.compressible_uncompressed_count} "
-                f"compressible response(s) sent without compression ({size_mb:.1f} MB)"
+                "compressible response(s) sent without compression "
+                f"({format_bytes(comp.compressible_uncompressed_bytes)})"
             )
             lines.append("")
 
@@ -7669,8 +8379,8 @@ class OutputFormatter:
                 truncated = (
                     path[:PATH_TRUNCATE_MEDIUM] if len(path) > PATH_TRUNCATE_MEDIUM else path
                 )
-                total_kb = int(item["total_bytes"]) / 1024
-                lines.append(f"| `{md_cell(truncated)}` | {item['count']} | {total_kb:.0f} KB |")
+                total = format_bytes(int(item["total_bytes"]))
+                lines.append(f"| `{md_cell(truncated)}` | {item['count']} | {total} |")
             lines.append("")
 
         return lines
@@ -7681,11 +8391,11 @@ class OutputFormatter:
             return []
 
         lines: list[str] = [f"## {self.ERROR_RUN_TITLE}", ""]
-        lines.append("| First failure | Last failure | Errors | Endpoints | Affected Domains |")
+        lines.append("| First failure | Last failure | Errors | Endpoints | Affected hosts |")
         lines.append("|-------|-----|--------|-----------|------------------|")
         for burst in report.error_bursts[:10]:
-            start = self._format_timestamp(burst.start_time, timespec="seconds")
-            end = self._format_timestamp(burst.end_time, timespec="seconds")
+            start = self._format_timestamp(burst.start_time, timespec="milliseconds")
+            end = self._format_timestamp(burst.end_time, timespec="milliseconds")
             domains = ", ".join(burst.affected_domains)
             lines.append(
                 f"| `{start}` | `{end}` | {burst.error_count} | {burst.endpoint_count} | "
@@ -7838,7 +8548,10 @@ BRIEF_PATH_MAX_CHARS = 60
 
 
 def _ms_or_dash(value: float) -> str:
-    return f"{value:.0f}" if value >= 0 else "-"
+    """Millisecond table cell: ``-`` when not recorded, ``<1`` below one millisecond."""
+    if value < 0:
+        return "-"
+    return "<1" if 0 < value < 1 else f"{value:,.0f}"
 
 
 def _brief_incident_lines(
@@ -7887,7 +8600,7 @@ def _brief_lines(
             f"- Capture: {formatter.format_timestamp(report.capture_start, timespec=_MS)}"
             f" → {formatter.format_timestamp(report.capture_end, timespec=_MS)} "
             f"({_format_duration(report.capture_end - report.capture_start)}), "
-            f"{report.total_requests:,} requests; query values "
+            f"{report.total_requests:,} request(s); query values "
             f"{'shown (--show-query)' if formatter.show_query else 'redacted'}"
         )
     lines.extend(f"- {note}" for note in formatter.capture_note_lines(report))
@@ -7922,26 +8635,29 @@ def _brief_lines(
                 match = "no config facts loaded"
             kind = OutputFormatter.TIMEOUT_CLUSTER_KINDS[cluster.kind]
             lines.append(
-                f"- {cluster.request_count} req at ~{cluster.median_ms / 1000:.2f}s "
+                f"- {cluster.request_count} req at ~{format_duration_ms(cluster.median_ms)} "
                 f"({cluster.basis}) "
-                f"({cluster.min_ms / 1000:.1f}-{cluster.max_ms / 1000:.1f}s, {statuses}; "
+                f"({format_duration_ms(cluster.min_ms)} to "
+                f"{format_duration_ms(cluster.max_ms)}, {statuses}; "
                 f"{kind}): {match}"
             )
         lines.append("")
 
-    ranked = sorted(
-        (e for e in report.endpoints if e.ttfb_timings.count),
-        key=lambda e: -tail_value(e.ttfb_timings),
-    )
+    ranked = [e for e in report.endpoints if e.served_wait_timings.count]  # already ranked
     if ranked:
-        lines.append("## Endpoints by wait for first byte (TTFB; tail = p95, or max when n<20)")
-        lines.append("| Endpoint | n | TTFB tail | TTFB p50 | Total tail |")
+        lines.append(
+            "## Slowest endpoints by wait (TTFB, non-5xx responses; ms; tail = p95, or max "
+            "when n<20)"
+        )
+        lines.append("| Endpoint | n | Wait tail | Wait p50 | Total tail |")
         lines.append("|---|---|---|---|---|")
         lines.extend(
             f"| {md_cell(e.method + ' ' + urlsplit(e.url_pattern).netloc)}"
-            f"{md_cell(short(urlparse(e.url_pattern).path))} | {e.ttfb_timings.count} | "
-            f"{tail_value(e.ttfb_timings):.0f} ({tail_label(e.ttfb_timings)}) | "
-            f"{e.ttfb_timings.p50:.0f} | {tail_value(e.timings):.0f} |"
+            f"{md_cell(short(urlparse(e.url_pattern).path))} | {e.served_wait_timings.count} | "
+            f"{_ms_or_dash(tail_value(e.served_wait_timings))} "
+            f"({tail_label(e.served_wait_timings)}) | "
+            f"{_ms_or_dash(known_ms(e.served_wait_timings.p50))} | "
+            f"{_ms_or_dash(tail_value(e.timings))} |"
             for e in ranked[:row_limit]
         )
         lines.append("")
@@ -7949,7 +8665,8 @@ def _brief_lines(
     if report.slowest_requests:
         lines.append("## Slowest requests (ms; - = not recorded)")
         lines.append(
-            "| Start | Request | Status | Total | Block | DNS | Conn | TLS | Send | Wait | Recv |"
+            "| Start | Request | Status | Total | Queued | DNS | TCP connect | TLS | Send | Wait "
+            "| Receive |"
         )
         lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
         for req in report.slowest_requests[:row_limit]:
@@ -7968,8 +8685,8 @@ def _brief_lines(
 
     settings = report.settings
     lines.append(
-        f"Thresholds: slow wait>{settings.slow_endpoint_ms:g}ms, "
-        f"idle gap>{settings.idle_gap_ms:g}ms, "
+        f"Thresholds: slow wait>{format_duration_ms(settings.slow_endpoint_ms)}, "
+        f"idle gap>{format_duration_ms(settings.idle_gap_ms)}, "
         f"timeout cluster≥{settings.timeout_cluster_min_requests}, width "
         f"{settings.timeout_cluster_tolerance_pct:g}% of shortest, expected: "
         f"{', '.join(settings.expected_rules) or 'none'}"
@@ -8057,20 +8774,37 @@ app = typer.Typer(
 )
 
 
+# Exit codes: each failure kind has its own code so scripts can tell them apart.
+EXIT_OK = 0  # analysis completed (whatever the report found)
+EXIT_INTERNAL_ERROR = 1  # a bug in har-analyze
+EXIT_USAGE = 2  # invalid command-line arguments (reported by the CLI framework)
+EXIT_INPUT_UNUSABLE = 3  # the input could not be read or is not a usable HAR
+EXIT_OUTPUT_FAILED = 4  # a report or export could not be written
+EXIT_INTERRUPTED = 130  # Ctrl+C
+
+
+def _print_version(value: bool) -> None:
+    if value:
+        typer.echo(f"har-analyze {__version__}")
+        raise typer.Exit(EXIT_OK)
+
+
 @app.callback()
-def callback() -> None:
+def callback(
+    show_version: bool = typer.Option(
+        False,
+        "--version",
+        callback=_print_version,
+        is_eager=True,
+        help="Show the version and exit.",
+    ),
+) -> None:
     """HAR file analyzer with deterministic performance insights."""
 
 
-@app.command()
-def version() -> None:
-    """Show version information."""
-    typer.echo(f"har-analyze version {__version__}")
-
-
 def setup_logging(verbose: bool) -> None:
-    """Configure logging."""
-    level = logging.DEBUG if verbose else logging.INFO
+    """Warnings only by default; ``--verbose`` adds progress messages."""
+    level = logging.INFO if verbose else logging.WARNING
     logging.basicConfig(
         level=level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -8112,10 +8846,13 @@ _DEFAULT_SETTINGS = AnalyzerSettings()
 @app.command()
 def analyze(  # noqa: PLR0913, PLR0917 - Typer requires one parameter per CLI option
     har_file: Path = typer.Argument(  # noqa: B008
-        ..., exists=True, file_okay=True, dir_okay=False, readable=True, help="Path to HAR file"
+        ..., help="HAR file to analyze (missing or unreadable files exit with code 3)"
     ),
     output: Path | None = typer.Option(  # noqa: B008
-        None, "--output", "-o", help="Export analysis to Markdown file"
+        None,
+        "--output",
+        "-o",
+        help="Write the report as Markdown to this file instead of the terminal",
     ),
     timezone: str | None = typer.Option(
         None,
@@ -8129,18 +8866,20 @@ def analyze(  # noqa: PLR0913, PLR0917 - Typer requires one parameter per CLI op
         help="Convert displayed timestamps to your local timezone",
     ),
     brief: bool = typer.Option(
-        False, "--brief", help="Compact Markdown (<= ~5 KB) for Copilot; no front-end advice"
+        False, "--brief", help="Compact Markdown summary (at most 5 KiB); no front-end advice"
     ),
     show_query: bool = typer.Option(
         False, "--show-query", help="Print query strings and fragments unredacted"
     ),
     export_events: Path | None = typer.Option(  # noqa: B008
-        None, "--export-events", help="Write one event per request to FILE.events.jsonl"
+        None,
+        "--export-events",
+        help="Also write one JSON event per request to this file (JSON Lines)",
     ),
     json_output: Path | None = typer.Option(  # noqa: B008
         None,
         "--json",
-        help="Write the full report model as JSON to FILE (URLs redacted like the other outputs)",
+        help="Also write the full report as JSON to this file (URLs redacted as in the report)",
     ),
     config_facts: Path | None = typer.Option(  # noqa: B008
         None,
@@ -8167,28 +8906,32 @@ def analyze(  # noqa: PLR0913, PLR0917 - Typer requires one parameter per CLI op
     slow_ms: float = typer.Option(
         _DEFAULT_SETTINGS.slow_endpoint_ms,
         "--slow-ms",
-        help="Slow endpoint threshold on wait for first byte, p95 (max when n<20)",
+        help="Slow endpoint: tail wait (TTFB) above this many ms (p95; max when n<20)",
     ),
     duration_exceeded_ms: float = typer.Option(
         _DEFAULT_SETTINGS.duration_exceeded_ms,
         "--duration-exceeded-ms",
-        help="Flag individual requests longer than this",
+        help="Flag individual requests longer than this many ms",
     ),
     gap_ms: float = typer.Option(
-        _DEFAULT_SETTINGS.idle_gap_ms, "--gap-ms", help="Report idle periods longer than this"
+        _DEFAULT_SETTINGS.idle_gap_ms,
+        "--gap-ms",
+        help="Report idle periods longer than this many ms",
     ),
     blocking_ms: float = typer.Option(
-        _DEFAULT_SETTINGS.blocking_ms, "--blocking-ms", help="Client-side blocking threshold"
+        _DEFAULT_SETTINGS.blocking_ms,
+        "--blocking-ms",
+        help="Flag requests queued in the browser longer than this many ms",
     ),
     large_payload_bytes: int = typer.Option(
         _DEFAULT_SETTINGS.large_payload_bytes,
         "--large-payload-bytes",
-        help="Large response threshold",
+        help="Flag responses whose decoded body exceeds this many bytes",
     ),
     large_request_body_bytes: int = typer.Option(
         _DEFAULT_SETTINGS.large_request_body_bytes,
         "--large-request-body-bytes",
-        help="Large POST/PUT body threshold",
+        help="List request bodies larger than this many bytes",
     ),
     redirect_chain_min_hops: int = typer.Option(
         _DEFAULT_SETTINGS.redirect_chain_min_hops,
@@ -8208,7 +8951,7 @@ def analyze(  # noqa: PLR0913, PLR0917 - Typer requires one parameter per CLI op
         min=0.1,
         help="Maximum cluster width as a percentage of the shortest duration",
     ),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show progress messages on stderr"),
 ) -> None:
     """Analyze a HAR file and generate performance insights."""
     setup_logging(verbose)
@@ -8239,60 +8982,94 @@ def analyze(  # noqa: PLR0913, PLR0917 - Typer requires one parameter per CLI op
         raise typer.BadParameter(str(exc)) from exc
 
     try:
-        # Parse HAR file
-        logger.info(f"Parsing HAR file: {har_file}")
-        # utf-8-sig: Windows tools write a byte-order mark that plain utf-8 rejects
-        with har_file.open("r", encoding="utf-8-sig") as f:
-            raw_data = json.load(f)
-        har = load_har(raw_data)
-        logger.info(f"Parsed {len(har.log.entries)} entries")
-        if har.load_notes.skipped_entry_count:
-            typer.echo(
-                f"Warning: skipped {har.load_notes.skipped_entry_count} malformed entries: "
-                f"{'; '.join(har.load_notes.skipped_entry_reasons)}",
-                err=True,
-            )
-
-        report = analyzer.analyze(har)
-        logger.info(f"Detected {len(report.issues)} issues")
-
-        if export_events:
-            events = build_events(har, analyzer, har_file.name)
-            write_events(events, export_events)
-            logger.info(f"Wrote {len(events)} events to {export_events}")
-
-        if json_output:
-            write_text_atomic(
-                json_output, generate_json_report(report, har_file.name, show_query=show_query)
-            )
-            logger.info(f"Wrote JSON report to {json_output}")
-
-        formatter = OutputFormatter(
-            timestamp_timezone=timestamp_timezone,
-            timestamp_timezone_label=timestamp_timezone_label,
-            show_query=show_query,
+        _run_analysis(
+            har_file,
+            analyzer,
+            OutputFormatter(
+                timestamp_timezone=timestamp_timezone,
+                timestamp_timezone_label=timestamp_timezone_label,
+                show_query=show_query,
+            ),
+            output=output,
+            brief=brief,
+            export_events=export_events,
+            json_output=json_output,
         )
-
-        if brief:
-            brief_content = generate_brief_report(report, formatter, har_file.name)
-            if output:
-                write_text_atomic(output, brief_content)
-                typer.echo(f"Brief report exported to: {output}")
-            else:
-                typer.echo(brief_content, nl=False)
-        elif output:
-            markdown_content = formatter.generate_markdown_report(report, har_file.name)
-            write_text_atomic(output, markdown_content)
-            typer.echo(f"Markdown report exported to: {output}")
-        else:
-            formatter.print_report(report)
-
     except KeyboardInterrupt:
-        typer.echo("\n\nInterrupted by user", err=True)
-        raise typer.Exit(130) from None
-    except Exception as e:
-        typer.echo(f"\nError: {e}", err=True)
-        raise typer.Exit(1) from e
+        typer.echo("\nInterrupted", err=True)
+        raise typer.Exit(EXIT_INTERRUPTED) from None
+    except HarFormatError as exc:
+        typer.echo(f"Error: {har_file}: {exc}", err=True)
+        raise typer.Exit(EXIT_INPUT_UNUSABLE) from exc
+    except _OutputError as exc:
+        typer.echo(f"Error: cannot write {exc.path}: {exc.reason}", err=True)
+        raise typer.Exit(EXIT_OUTPUT_FAILED) from exc
+    except OSError as exc:
+        typer.echo(f"Error: cannot read {har_file}: {exc.strerror or exc}", err=True)
+        raise typer.Exit(EXIT_INPUT_UNUSABLE) from exc
+    except Exception as exc:
+        logger.exception("Internal error")
+        typer.echo(f"Internal error (a bug in har-analyze): {exc!r}", err=True)
+        raise typer.Exit(EXIT_INTERNAL_ERROR) from exc
+
+
+class _OutputError(Exception):
+    """Writing a report or export failed (exit code 4)."""
+
+    def __init__(self, path: Path, reason: str) -> None:
+        super().__init__(f"{path}: {reason}")
+        self.path = path
+        self.reason = reason
+
+
+def _write_output(path: Path, write: Callable[[Path], None]) -> None:
+    try:
+        write(path)
+    except OSError as exc:
+        raise _OutputError(path, exc.strerror or str(exc)) from exc
+
+
+def _run_analysis(  # noqa: PLR0913 - one argument per output option
+    har_file: Path,
+    analyzer: HarAnalyzer,
+    formatter: OutputFormatter,
+    *,
+    output: Path | None,
+    brief: bool,
+    export_events: Path | None,
+    json_output: Path | None,
+) -> None:
+    logger.info("Reading %s", har_file)
+    har = load_har_file(har_file)
+    logger.info("Read %d entries", len(har.log.entries))
+    if har.load_notes.skipped_entry_count:
+        typer.echo(
+            f"Warning: skipped {har.load_notes.skipped_entry_count} unusable entries: "
+            f"{'; '.join(har.load_notes.skipped_entry_reasons)}",
+            err=True,
+        )
+    report = analyzer.analyze(har)
+    if export_events:
+        events = build_events(har, analyzer, har_file.name)
+        _write_output(export_events, lambda path: write_events(events, path))
+        logger.info("Wrote %d events to %s", len(events), export_events)
+    if json_output:
+        json_text = generate_json_report(report, har_file.name, show_query=formatter.show_query)
+        _write_output(json_output, lambda path: write_text_atomic(path, json_text))
+        logger.info("Wrote the JSON report to %s", json_output)
+    if brief:
+        brief_content = generate_brief_report(report, formatter, har_file.name)
+        if output:
+            _write_output(output, lambda path: write_text_atomic(path, brief_content))
+            typer.echo(f"Brief report written to {output}")
+        else:
+            typer.echo(brief_content, nl=False)
+    elif output:
+        markdown_content = formatter.generate_markdown_report(report, har_file.name)
+        _write_output(output, lambda path: write_text_atomic(path, markdown_content))
+        typer.echo(f"Markdown report written to {output}")
+    else:
+        formatter.print_report(report)
 
 
 def main() -> None:
